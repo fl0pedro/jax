@@ -188,6 +188,10 @@ PyDevice::MemoryStats() const {
   return result;
 }
 
+absl::Status PyDevice::ClearMemoryStats() const {
+  return device_->ClearMemoryStats();
+}
+
 absl::StatusOr<std::intptr_t> PyDevice::GetStreamForExternalReadyEvents()
     const {
   ifrt::PjRtDevice* device = llvm::dyn_cast<ifrt::PjRtDevice>(device_);
@@ -268,6 +272,12 @@ PyType_Slot PyDevice::slots_[] = {
           "be implemented on all platforms, and different platforms may return "
           "different stats, or -1 for unavailable stats. 'bytes_in_use' is "
           "usually available. Intended for diagnostic use.")
+      .def(
+          "clear_memory_stats",
+          [](const PyDevice& self) {
+            xla::ThrowIfError(self.ClearMemoryStats());
+          },
+          "Clears the peak memory tracking statistics for this device.")
       .def(
           "get_stream_for_external_ready_events",
           xla::ValueOrThrowWrapper(&PyDevice::GetStreamForExternalReadyEvents));

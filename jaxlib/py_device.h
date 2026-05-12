@@ -63,6 +63,7 @@ class PyDevice {
   absl::StatusOr<
       std::optional<nanobind::typed<nanobind::dict, nanobind::str, int>>>
   MemoryStats() const;
+  absl::Status ClearMemoryStats() const;
 
   absl::StatusOr<std::intptr_t> GetStreamForExternalReadyEvents() const;
 
