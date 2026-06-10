@@ -189,7 +189,13 @@ PyDevice::MemoryStats() const {
 }
 
 absl::Status PyDevice::ClearMemoryStats() const {
-  return device_->ClearMemoryStats();
+  GlobalPyRefManager()->CollectGarbage();
+  ifrt::PjRtDevice* device = llvm::dyn_cast<ifrt::PjRtDevice>(device_);
+  if (device == nullptr || !device->IsAddressable()) {
+    return xla::InvalidArgument(
+        "ClearMemoryStats is only supported for addressable PjRt devices.");
+  }
+  return device->pjrt_device()->ClearMemoryStats();
 }
 
 absl::StatusOr<std::intptr_t> PyDevice::GetStreamForExternalReadyEvents()
