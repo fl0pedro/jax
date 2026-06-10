@@ -41,6 +41,7 @@ limitations under the License.
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_custom_partitioner_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_helpers.h"
+#include "xla/pjrt/c/pjrt_c_api_status_utils.h"
 #include "xla/pjrt/status_casters.h"
 #include "xla/python/custom_call_batch_partitioner.h"
 #include "xla/python/custom_partition_callback.h"
@@ -292,21 +293,21 @@ Args:
 
   nb::module_ hlo_sharding_util_m = m.def_submodule(
       "hlo_sharding_util", "Utilities for manipulating HloSharding.");
-  hlo_sharding_util_m.attr("_HloSharding") = m.attr("HloSharding");
   hlo_sharding_util_m.def(
       "PartiallyReplicateTiledShardingOnDims",
       [](const xla::HloSharding& sharding, std::vector<int64_t> dims) {
         return xla::hlo_sharding_util::PartiallyReplicateTiledShardingOnDims(
             sharding, dims);
       },
-      nb::sig(
-          // clang-format off
+      nb::
+          sig(
+              // clang-format off
           "def PartiallyReplicateTiledShardingOnDims("
-          "sharding: _HloSharding, "
+          "sharding: jaxlib._hlo.HloSharding, "  // NOLINT
           "dims: typing.Sequence[int], /"
-          ") -> _HloSharding"
-          // clang-format on
-          ));
+          ") -> jaxlib._hlo.HloSharding"  // NOLINT
+                             // clang-format on
+              ));
 
   m.def(
       "register_custom_call_as_batch_partitionable",

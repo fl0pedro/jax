@@ -36,11 +36,15 @@ on:
       rocm-version:
         description: "Which ROCM version to test?"
         type: string
-        default: "7"
+        default: "7.2.0"
       rocm-tag:
         description: "ROCm tag for container image (e.g., rocm720)"
         type: string
         default: "rocm720"
+      rocm-release-version:
+        description: "Release version for S3 path resolution (e.g., 7.2.0 or therock-latest)"
+        type: string
+        default: ""
       enable-x64:
         description: "Should x64 mode be enabled?"
         type: string
@@ -79,6 +83,10 @@ on:
         required: false
         default: 'false'
         type: string
+      s3_download_uri:
+        description: "S3 URI for ROCm plugin/PJRT wheels (use 'latest' to resolve via LATEST pointer)"
+        default: 'latest'
+        type: string
       clone_main_xla:
         description: "Should latest XLA be used?"
         type: string
@@ -95,7 +103,7 @@ jobs:
         shell: bash
     runs-on: ${{ inputs.runner }}
     container:
-      image: ghcr.io/rocm/jax-dev-ubu24.${{ inputs.rocm-tag }}:latest
+      image: ghcr.io/rocm/jax-dev-ubu24.${{ inputs.rocm-tag }}:latest  # zizmor: ignore[unpinned-images]
       volumes:
         - /data:/data
       options: >-
@@ -134,10 +142,12 @@ jobs:
         with:
           python: ${{ inputs.python }}
           rocm-version: ${{ inputs.rocm-version }}
+          rocm-release-version: ${{ inputs.rocm-release-version }}
           download-jax-from-gcs: ${{ inputs.download-jax-from-gcs }}
           skip-download-jaxlib-and-plugins-from-gcs: ${{ inputs.skip-download-jaxlib-and-plugins-from-gcs }}
           jaxlib-version: ${{ inputs.jaxlib-version }}
           gcs_download_uri: ${{ inputs.gcs_download_uri }}
+          s3_download_uri: ${{ inputs.s3_download_uri }}
       # Halt for testing
       - name: Wait For Connection
         uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
@@ -145,9 +155,11 @@ jobs:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
       - name: Resolve RBE container image digest
         id: rbe-image
+        env:
+          ROCM_TAG: ${{ inputs.rocm-tag }}
         run: |
-          IMAGE="ghcr.io/rocm/jax-dev-ubu24.${{ inputs.rocm-tag }}"
-          REPO="rocm/jax-dev-ubu24.${{ inputs.rocm-tag }}"
+          IMAGE="ghcr.io/rocm/jax-dev-ubu24.${ROCM_TAG}"
+          REPO="rocm/jax-dev-ubu24.${ROCM_TAG}"
           TOKEN=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" | \
             python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
           echo "::add-mask::${TOKEN}"
@@ -159,15 +171,21 @@ jobs:
           echo "rbe_image=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
       - name: "Bazel ROCm tests with build_jax=${{ inputs.build_jax }}, build_jaxlib=${{ inputs.build_jaxlib }}"
         timeout-minutes: 120
+        env:
+          BUILD_JAXLIB: ${{ inputs.build_jaxlib }}
+          BUILD_JAX: ${{ inputs.build_jax }}
+          PYTHON: ${{ inputs.python }}
+          ENABLE_X64: ${{ inputs.enable-x64 }}
+          RBE_IMAGE: ${{ steps.rbe-image.outputs.rbe_image }}
         run: |
           ./ci/run_bazel_test_rocm_rbe.sh  \
             --config=single_gpu \
             --local_test_jobs=4 \
-            --//jax:build_jaxlib="${{ inputs.build_jaxlib }}" \
-            --//jax:build_jax="${{ inputs.build_jax }}" \
-            --repo_env=HERMETIC_PYTHON_VERSION="${{ inputs.python }}" \
-            --action_env=JAX_ENABLE_X64="${{ inputs.enable-x64 }}" \
-            --repo_env=TF_ROCM_RBE_DOCKER_IMAGE="${{ steps.rbe-image.outputs.rbe_image }}" \
+            --//jax:build_jaxlib="${BUILD_JAXLIB}" \
+            --//jax:build_jax="${BUILD_JAX}" \
+            --repo_env=HERMETIC_PYTHON_VERSION="${PYTHON}" \
+            --action_env=JAX_ENABLE_X64="${ENABLE_X64}" \
+            --repo_env=TF_ROCM_RBE_DOCKER_IMAGE="${RBE_IMAGE}" \
             "${JAXCI_ROCM_LOCK_FLAG:-}"
       - name: Upload test artifacts
         if: always()

@@ -22,8 +22,8 @@ on:
       - "CI - with Numpy/Scipy nightly wheels (nightly)"
       - "CI - Address Sanitizer (nightly)"
       - "CI - Bazel CPU tests"
-      - "CI - Wheel Tests (Nightly/Release)"
       - "CI - Cloud TPU (presubmit)"
+      - "CI - Wheel Tests (Nightly/Release)"
     types:
       - completed
 
@@ -33,13 +33,19 @@ permissions:
 
 jobs:
   upload:
+    if: github.repository_owner == 'jax-ml'
     name: "Upload Workflow Metadata"
-    runs-on: linux-x86-n4-16
+    runs-on: linux-x86-n4-4
     container: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
     defaults:
       run:
         shell: bash
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
       - name: Fetch and Upload Metadata
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -57,7 +63,14 @@ jobs:
           # Download logs
           curl -f -s -L -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/$REPO/actions/runs/$WORKFLOW_RUN_ID/logs" > logs.zip
-          unzip logs.zip -d logs
+
+          # Check if zip file is empty before unzipping
+          if [ -s logs.zip ]; then
+            unzip logs.zip -d logs
+          else
+            echo "Warning: logs.zip is empty or not found. Creating empty logs directory."
+            mkdir logs
+          fi
 
           # Path sanitization
           SAFE_NAME="${WORKFLOW_RUN_NAME//\//-}"
@@ -65,3 +78,7 @@ jobs:
 
           # Upload everything
           gcloud storage cp -r workflow_run.json jobs.json logs "$gcs_upload_uri/"
+
+          # Process test results using the script
+          # TODO(dsuo): Enable processing test results once GHA runner GCP permissions are resolved.
+          # bash third_party/py/jax/oss/ci/postprocess/process_test_results.sh "$gcs_upload_uri"

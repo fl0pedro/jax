@@ -14,8 +14,7 @@
 
 # Package for Mosaic-specific Pallas extensions
 
-load("@rules_python//python:defs.bzl", "py_library")
-load("//jaxlib:jax.bzl", "py_deps", "pytype_strict_library")
+load("//jaxlib:jax.bzl", "jax_visibility", "py_deps", "pytype_library", "pytype_strict_library")
 
 package(
     default_applicable_licenses = [],
@@ -24,12 +23,13 @@ package(
     ],
 )
 
-py_library(
+pytype_strict_library(
     name = "core",
     srcs = [
         "__init__.py",
         "core.py",
     ],
+    type_checking = "pyrefly",
     deps = [
         "//jax",
         "//jax/_src:core",
@@ -42,9 +42,10 @@ py_library(
     ] + py_deps("numpy"),
 )
 
-py_library(
+pytype_strict_library(
     name = "error_handling",
     srcs = ["error_handling.py"],
+    type_checking = "pyrefly",
     deps = [
         "//jax/_src:compiler",
         "//jax/_src:traceback_util",
@@ -52,9 +53,10 @@ py_library(
     ],
 )
 
-py_library(
+pytype_library(
     name = "primitives",
     srcs = ["primitives.py"],
+    type_checking = "pyrefly",
     deps = [
         ":core",
         "//jax",
@@ -69,11 +71,13 @@ py_library(
     ],
 )
 
-py_library(
+pytype_library(
     name = "pallas_call_registration",
     srcs = ["pallas_call_registration.py"],
+    type_checking = "pyrefly",
     deps = [
         ":core",
+        ":helpers",
         ":lowering",
         ":sc_lowering",
         "//jax",
@@ -95,6 +99,9 @@ pytype_strict_library(
     name = "lowering",
     srcs = ["lowering.py"],
     type_checking = "pyrefly",
+    visibility = [
+        "//jax:internal",
+    ] + jax_visibility("pallas/mosaic/lowering"),
     deps = [
         ":core",
         ":error_handling",
@@ -135,22 +142,16 @@ pytype_strict_library(
         "sc_lowering.py",
     ],
     type_checking = "pyrefly",
-    visibility = ["//jax/experimental:pallas_sc_users"],
+    visibility = ["//visibility:private"],
     deps = [
         ":core",
         ":lowering",
         ":primitives",
         ":sc_core",
-        ":tpu_info",
-        "//jax/_src:api_util",
         "//jax/_src:core",
         "//jax/_src:debugging",
         "//jax/_src:lax",
-        "//jax/_src:mesh",
-        "//jax/_src:mlir",
         "//jax/_src:numpy",
-        "//jax/_src:partial_eval",
-        "//jax/_src:source_info_util",
         "//jax/_src:tree_util",
         "//jax/_src:util",
         "//jax/_src/lib",
@@ -171,10 +172,7 @@ pytype_strict_library(
         ":tpu_info",
         "//jax",
         "//jax/_src:core",
-        "//jax/_src:lax",
-        "//jax/_src:partial_eval",
         "//jax/_src:tree_util",
-        "//jax/_src:util",
         "//jax/_src/pallas",
     ],
 )
@@ -203,25 +201,29 @@ pytype_strict_library(
     ],
 )
 
-py_library(
+pytype_library(
     name = "pipeline",
     srcs = ["pipeline.py"],
+    type_checking = "pyrefly",
     deps = [
         ":core",
+        ":helpers",
         ":primitives",
         ":tpu_info",
         "//jax",
         "//jax/_src:api_util",
+        "//jax/_src:lax",
         "//jax/_src:util",
         "//jax/_src/pallas",
-        "//jax/experimental:pallas",
+        "//jax/_src/pallas/mosaic:lowering",
         "//jax/extend:backend",
     ] + py_deps("numpy"),
 )
 
-py_library(
+pytype_library(
     name = "random",
     srcs = ["random.py"],
+    type_checking = "pyrefly",
     deps = [
         ":primitives",
         "//jax",
@@ -230,9 +232,10 @@ py_library(
     ] + py_deps("numpy"),
 )
 
-py_library(
+pytype_strict_library(
     name = "helpers",
     srcs = ["helpers.py"],
+    type_checking = "pyrefly",
     deps = [
         ":core",
         ":primitives",

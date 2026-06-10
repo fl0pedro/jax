@@ -47,6 +47,9 @@ except ImportError:
 
 
 _cext = mgpu.dialect._cext if mgpu.dialect is not None else None
+# TODO(bchetioui): simplify other use sites to use the aliases directly.
+TileTransformAttr = mgpu.dialect.TileTransformAttr
+SwizzleTransformAttr = mgpu.dialect.SwizzleTransformAttr
 
 
 config.parse_flags_with_absl()
@@ -76,7 +79,7 @@ def workgroup_ptr_ty() -> ir.Type:
   workgroup_nvptx_address_space = mgpu_utils.gpu_address_space_to_nvptx(
       gpu.AddressSpace.Workgroup
   )
-  return ir.Type.parse(f"!llvm.ptr<{workgroup_nvptx_address_space}>")
+  return llvm.PointerType.get(workgroup_nvptx_address_space)
 
 
 def undefs(*tys: ir.Type) -> list[ir.Value]:
@@ -170,7 +173,7 @@ class DialectTest(MosaicGpuTest):
   def test_initialize_barrier_op_with_a_non_shared_base_pointer_fails(self):
     with ir.InsertionPoint(self.module.body):
       mgpu.dialect.initialize_barrier(
-          llvm.UndefOp(ir.Type.parse(f"!llvm.ptr<{0}>")),
+          llvm.UndefOp(llvm.PointerType.get(address_space=0)),
           arrival_count=1,
           num_barriers=2,
           orders_tensor_core=False,
@@ -537,6 +540,99 @@ class DialectTest(MosaicGpuTest):
     with self.assertRaisesRegex(
         ir.MLIRError,
         "Both `gmem_peer_id` or `is_global_broadcast` cannot be specified",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_types_match(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.BF16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The `a` and `b` inputs must have the same element type.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_acc_m_not_equal_to_a_m_dim(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([32, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The accumulator's first dimension 32 must be equal to the first dimension of `a`: 64.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_acc_n_not_equal_to_b_n_dim(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 16], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The accumulator's second dimension 16 must be equal to the second"
+        " dimension of `b`: 8.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_a_k_dim_not_equal_to_b_k_dim(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([32, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "`a`'s second dimension 16 must be equal to `b`'s first dimension: 32.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_int_operands_acc_not_i32(self):
+    with ir.InsertionPoint(self.module.body):
+      i8 = ir.IntegerType.get_signless(8)
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 32], i8),
+          ir.VectorType.get([32, 8], i8),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        r"Only i32 accumulator supported for integer operands\.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_float_operands_acc_not_f32(self):
+    with ir.InsertionPoint(self.module.body):
+      i32 = ir.IntegerType.get_signless(32)
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], i32),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "Only float accumulator supported for floating operands.",
     ):
       self.module.operation.verify()
 
@@ -1799,6 +1895,48 @@ ir.MLIRError,
     [use] = rc_op.result.uses
     self.assertIsInstance(use.owner, mgpu.dialect.WarpMapOp)
 
+  def test_reinterpret_cast_inside_warp_map_is_hoisted_when_all_consumers_are_identical_reinterpret_casts(self):
+    with ir.InsertionPoint(self.module.body):
+      ref_ty0 = ir.MemRefType.get((4,), ir.F16Type.get())
+      ref_ty1 = ir.MemRefType.get((2, 2), ir.F16Type.get())
+      [ref] = undefs(ref_ty0)
+      warp_map = mgpu.dialect.WarpMapOp(operands=[ref])
+      with ir.InsertionPoint(warp_map.body):
+        mgpu.dialect.reinterpret_cast(ref_ty1, warp_map.body.arguments[0])
+        mgpu.dialect.reinterpret_cast(ref_ty1, warp_map.body.arguments[0])
+    pm = mlir_interpreter.passmanager.PassManager.parse(
+        "builtin.module(canonicalize)", self.module.context
+    )
+    pm.run(self.module.operation)
+    rc_ops = self.find_ops(mgpu.dialect.ReinterpretCastOp)
+    self.assertLen(rc_ops, 1)
+    [rc_op] = rc_ops
+    [use] = rc_op.result.uses
+    self.assertIsInstance(use.owner, mgpu.dialect.WarpMapOp)
+
+  def test_reinterpret_cast_inside_warp_map_is_not_hoisted_when_consumers_have_different_types(self):
+    with ir.InsertionPoint(self.module.body):
+      ref_ty0 = ir.MemRefType.get((4,), ir.F16Type.get())
+      ref_ty1 = ir.MemRefType.get((2, 2), ir.F16Type.get())
+      ref_ty2 = ir.MemRefType.get((4, 1), ir.F16Type.get())
+      [ref] = undefs(ref_ty0)
+      warp_map = mgpu.dialect.WarpMapOp(operands=[ref])
+      with ir.InsertionPoint(warp_map.body):
+        a = mgpu.dialect.reinterpret_cast(ref_ty1, warp_map.body.arguments[0])
+        b = mgpu.dialect.reinterpret_cast(ref_ty2, warp_map.body.arguments[0])
+        # Add an arbitrary side-effecting user in order to prevent the casts
+        # from being DCE'd.
+        mgpu.dialect.optimization_barrier([a, b])
+    pm = mlir_interpreter.passmanager.PassManager.parse(
+        "builtin.module(canonicalize)", self.module.context
+    )
+    pm.run(self.module.operation)
+    rc_ops = self.find_ops(mgpu.dialect.ReinterpretCastOp)
+    self.assertLen(rc_ops, 2)
+    [rc_op1, rc_op2] = rc_ops
+    self.assertEqual(rc_op1.parent, warp_map)
+    self.assertEqual(rc_op2.parent, warp_map)
+
   def test_reinterpret_cast_of_reinterpret_cast_is_folded(self):
 
     bf16 = ir.BF16Type.get()
@@ -1989,7 +2127,7 @@ class DialectLoweringTest(MosaicGpuTest):
       splat.attributes["out_layouts"] = ir.ArrayAttr.get([
           splat_layout_attr
       ])
-      ptr = llvm.mlir_undef(ir.Type.parse("!llvm.ptr"))
+      ptr = llvm.mlir_undef(llvm.PointerType.get())
       ref = mgpu_utils.ptr_as_memref(ptr, ir.MemRefType.get(shape, i32))
       other_vec = mgpu.dialect.VectorLoadOp(ref)
       strided_layout_attr = layouts.to_layout_attr(
@@ -2131,6 +2269,160 @@ class DialectLoweringTest(MosaicGpuTest):
       strides, _ = ty_transformed.get_strides_and_offset()
       self.assertEqual(strides, [512, 4096, 1, 16])
 
+  def test_lowering_memref_transpose_nd(self):
+    with ir.InsertionPoint(self.module.body):
+      ty_logical = ir.MemRefType.get(
+          (64, 128, 256),
+          ir.BF16Type.get(),
+          memory_space=mgpu_utils.smem(),
+      )
+      in_tiling = (16, 32)
+      tile_transform_attr = mgpu.dialect.TileTransformAttr.get(in_tiling)
+      transforms_attr = ir.ArrayAttr.get([ir.ArrayAttr.get([tile_transform_attr])])
+      slice_op = mgpu.dialect.SliceSMEMOp(ty_logical, 0)
+      slice_op.attributes["out_transforms"] = transforms_attr
+      ref_wrapped = slice_op.result
+      ref_transposed = mgpu_utils.memref_transpose(ref_wrapped, (0, 2, 1))
+      attributes = ref_transposed.owner.attributes
+      attributes["in_transforms"] = transforms_attr
+      out_tiling = in_tiling[::-1]
+      tile_transform_attr = mgpu.dialect.TileTransformAttr.get(out_tiling)
+      transforms_attr = ir.ArrayAttr.get([ir.ArrayAttr.get([tile_transform_attr])])
+      attributes["out_transforms"] = transforms_attr
+
+    mgpu.lower_mgpu_dialect(self.module, None)
+
+    [new_transpose_op] = self.find_ops(memref.TransposeOp)
+    expected_permutation = ir.AffineMap.get_permutation([0, 2, 1, 4, 3])
+    self.assertEqual(new_transpose_op.permutation.value, expected_permutation)
+
+  def test_lowering_memref_transpose_nd_bad_inout_tiling(self):
+    with ir.InsertionPoint(self.module.body):
+      ty_logical = ir.MemRefType.get(
+          (64, 128, 256),
+          ir.BF16Type.get(),
+          memory_space=mgpu_utils.smem(),
+      )
+      in_tiling = (16, 32)
+      tile_transform_attr = mgpu.dialect.TileTransformAttr.get(in_tiling)
+      transforms_attr = ir.ArrayAttr.get([ir.ArrayAttr.get([tile_transform_attr])])
+      slice_op = mgpu.dialect.SliceSMEMOp(ty_logical, 0)
+      slice_op.attributes["out_transforms"] = transforms_attr
+      ref_wrapped = slice_op.result
+      ref_transposed = mgpu_utils.memref_transpose(ref_wrapped, (0, 2, 1))
+      attributes = ref_transposed.owner.attributes
+      attributes["in_transforms"] = attributes["out_transforms"] = transforms_attr
+
+    with self.assertRaisesRegex(ValueError, "Invalid in/out transforms."):
+      mgpu.lower_mgpu_dialect(self.module, None)
+
+  def test_lowering_memref_transpose_nd_size_mismatch_transforms_raises(self):
+    with ir.InsertionPoint(self.module.body):
+      ty_logical = ir.MemRefType.get(
+          (64, 128, 256),
+          ir.BF16Type.get(),
+          memory_space=mgpu_utils.smem(),
+      )
+      in_tiling = (16, 32)
+      tile_transform_attr = mgpu.dialect.TileTransformAttr.get(in_tiling)
+      transforms_attr = ir.ArrayAttr.get([ir.ArrayAttr.get([tile_transform_attr])])
+      slice_op = mgpu.dialect.SliceSMEMOp(ty_logical, 0)
+      slice_op.attributes["out_transforms"] = transforms_attr
+      ref_wrapped = slice_op.result
+      ref_transposed = mgpu_utils.memref_transpose(ref_wrapped, (0, 2, 1))
+      attributes = ref_transposed.owner.attributes
+      attributes["in_transforms"] = transforms_attr
+      out_transforms_attr = ir.ArrayAttr.get(
+          [ir.ArrayAttr.get([tile_transform_attr, tile_transform_attr])]
+      )
+      attributes["out_transforms"] = out_transforms_attr
+
+    with self.assertRaisesRegex(ValueError, "Size mismatch for in/out transforms."):
+      mgpu.lower_mgpu_dialect(self.module, None)
+
+  def test_lowering_memref_transposed_tiled_and_untiled_tims_raises(self):
+    with ir.InsertionPoint(self.module.body):
+      ty_logical = ir.MemRefType.get(
+          (64, 128, 256),
+          ir.BF16Type.get(),
+          memory_space=mgpu_utils.smem(),
+      )
+      in_tiling = (16, 32)
+      tile_transform_attr = mgpu.dialect.TileTransformAttr.get(in_tiling)
+      transforms_attr = ir.ArrayAttr.get([ir.ArrayAttr.get([tile_transform_attr])])
+      slice_op = mgpu.dialect.SliceSMEMOp(ty_logical, 0)
+      slice_op.attributes["out_transforms"] = transforms_attr
+      ref_wrapped = slice_op.result
+      ref_transposed = mgpu_utils.memref_transpose(ref_wrapped, (2, 1, 0))
+      attributes = ref_transposed.owner.attributes
+      attributes["in_transforms"] = attributes["out_transforms"] = transforms_attr
+
+    with self.assertRaisesRegex(ValueError, "Cannot tile a transpose"):
+      mgpu.lower_mgpu_dialect(self.module, None)
+
+  @parameterized.parameters(
+      # We use lambdas here because we need a MLIR context to be set to produce
+      # the relevant attributes.
+      (lambda: [TileTransformAttr.get((16, 32))],
+       lambda: [TileTransformAttr.get((32, 16))],
+       r"Input tiling .* is not compatible with"),
+      (lambda: [TileTransformAttr.get((1, 16))],
+       lambda: [TileTransformAttr.get((1, 16))],
+       "Input/output tiling mismatch"),
+      (lambda: [TileTransformAttr.get((1, 16))],
+       lambda: [],
+       "Expected the same number of in/out transforms"),
+      (lambda: [SwizzleTransformAttr.get(16)],
+       lambda: [SwizzleTransformAttr.get(32)],
+       "Swizzle mismatch"),
+  )
+  def test_lowering_memref_collapse_shape_with_incompatible_transforms_raises(
+      self, in_transforms_fn, out_transforms_fn, error_regex
+  ):
+    with ir.InsertionPoint(self.module.body):
+      in_transforms = ir.ArrayAttr.get([
+          ir.ArrayAttr.get(in_transforms_fn())
+      ])
+      out_transforms = ir.ArrayAttr.get([
+          ir.ArrayAttr.get(out_transforms_fn())
+      ])
+      smem = mgpu_utils.smem()
+      bf16 = ir.BF16Type.get()
+      in_ty = ir.MemRefType.get((128, 128), bf16, memory_space=smem)
+      out_ty = ir.MemRefType.get((128 * 128,), bf16, memory_space=smem)
+      smem = mgpu.dialect.slice_smem(in_ty, 0)
+      smem.owner.attributes["out_transforms"] = in_transforms
+      collapsed = memref.collapse_shape(out_ty, smem, [[0, 1]])
+      collapsed.owner.attributes["in_transforms"] = in_transforms
+      collapsed.owner.attributes["out_transforms"] = out_transforms
+    with self.assertRaisesRegex(ValueError, error_regex):
+      mgpu.lower_mgpu_dialect(self.module, None)
+
+  def test_lowering_memref_collapse_shape_tiles_reassociation_correctly(self):
+    with ir.InsertionPoint(self.module.body):
+      in_transforms = ir.ArrayAttr.get([
+          ir.ArrayAttr.get([TileTransformAttr.get((1, 16))])
+      ])
+      out_transforms = ir.ArrayAttr.get([
+          ir.ArrayAttr.get([TileTransformAttr.get((16,))])
+      ])
+      smem = mgpu_utils.smem()
+      bf16 = ir.BF16Type.get()
+      in_ty = ir.MemRefType.get((10, 128, 128), bf16, memory_space=smem)
+      out_ty = ir.MemRefType.get((10, 128 * 128,), bf16, memory_space=smem)
+      smem = mgpu.dialect.slice_smem(in_ty, 0)
+      smem.owner.attributes["out_transforms"] = in_transforms
+      collapsed = memref.collapse_shape(out_ty, smem, [[0], [1, 2]])
+      collapsed.owner.attributes["in_transforms"] = in_transforms
+      collapsed.owner.attributes["out_transforms"] = out_transforms
+    mgpu.lower_mgpu_dialect(self.module, None)
+    [collapse_shape] = self.find_ops(memref.CollapseShapeOp)
+    self.assertIsInstance(collapse_shape, memref.CollapseShapeOp)
+    reassociation = [
+        [d.value for d in dims] for dims in collapse_shape.reassociation
+    ]
+    self.assertEqual(reassociation, [[0], [1, 2], [3, 4]])
+
   def test_optimized_gmem_transfers_are_not_supported(self):
     def body(ctx, input, output, scratch):
       del ctx, output, scratch
@@ -2178,6 +2470,32 @@ class DialectLoweringTest(MosaicGpuTest):
           smem_scratch_shape=jax.ShapeDtypeStruct((), jnp.int32),
           thread_semantics=mgpu.LoweringSemantics.Warpgroup,
       )
+
+  def test_transformed_strided_load_raises(self):
+    shape = (128, 128)
+    dtype = ir.BF16Type.get()
+
+    with ir.InsertionPoint(self.module.body):
+      ty_logical = ir.MemRefType.get(shape, dtype, memory_space=mgpu_utils.smem())
+      smem = mgpu.dialect.slice_smem(ty_logical, 0)
+      transforms_attr = ir.ArrayAttr.get([
+          ir.ArrayAttr.get([
+              mgpu.dialect.TileTransformAttr.get((64, 64)),
+              mgpu.dialect.SwizzleTransformAttr.get(128),
+          ])
+      ])
+      smem.owner.attributes["out_transforms"] = transforms_attr
+      load = mgpu.dialect.vector_load(smem)
+      strided_layout = mgpu.WGStridedFragLayout.from_shaped_type(load.type)
+      load.owner.attributes["out_layouts"] = ir.ArrayAttr.get([
+          layouts.to_layout_attr(strided_layout)
+      ])
+      load.owner.attributes["in_transforms"] = transforms_attr
+
+    with self.assertRaisesRegex(
+        NotImplementedError, "Transformed or swizzled strided loads are not supported"
+    ):
+      mgpu.lower_mgpu_dialect(self.module, None)
 
   def test_transform_type_handles_type_with_untiled_dimensions_correctly(self):
     ty = ir.MemRefType.get(

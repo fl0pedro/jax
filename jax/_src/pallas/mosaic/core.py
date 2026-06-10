@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Mapping, Sequence
+import contextlib
 import dataclasses
 import enum
 from typing import Any, Literal
 
 import jax
 from jax._src import core as jax_core
+from jax._src import deprecations
 from jax._src import linear_util as lu
 from jax._src import state
 from jax._src import util
@@ -102,17 +104,24 @@ class CompilerParams:
     internal_scratch_in_bytes: The size of the internal scratch space used by
       Mosaic.
     serialization_format: The serialization format for the kernel body.
-    kernel_type: Specify if the kernel is meant to run on TensorCore or one of
-      the SparseCores
     disable_bounds_checks: Disable bounds checks in the kernel.
     disable_semaphore_checks: Disable semaphore checks in the kernel.
     skip_device_barrier: Skip the default device barrier for the kernel.
     allow_collective_id_without_custom_barrier: Allow the use of collective_id
       without a custom barrier.
     use_tc_tiling_on_sc: Use TensorCore tiling for SparseCore. This flag is only
-      used for ``SC_*_SUBCORE`` kernels.
+      used for ``SC_*_SUBCORE`` kernels and it implicitly defaults to True.
     needs_layout_passes: Whether to use vector layout inference passes. This
       flag is temporary and will eventually be removed.
+    fuse_transposed_lhs_in_matmul: Hint to compilers to attempt to fuse
+      transposed LHS in MXU if users specify the transposed layout of LHS in
+      matmul operations, e.g., `jnp.einsum('km,kn->mn', lhs, rhs)`; on the other
+      hand, When transposition is performed separately from multiplication (e.g.
+      jnp.matmul(lhs.T, rhs)), this flag does not affect the compiler's decision
+      (it might still decide to do it if obviously profitable). Note that this
+      flag is at the best-effort basis, and the fusion will only be performed
+      when compilers determine it is feasible. Also, the fusion is not always
+      profitable and therefore should be used sparingly.
   """
 
   dimension_semantics: tuple[DimensionSemantics, ...] | None = None
@@ -123,14 +132,14 @@ class CompilerParams:
   flags: dict[str, Any] | None = None
   internal_scratch_in_bytes: int | None = None
   serialization_format: int = 1
-  kernel_type: CoreType = CoreType.TC
   disable_bounds_checks: bool = False
   disable_semaphore_checks: bool = False
   skip_device_barrier: bool = False
   allow_collective_id_without_custom_barrier: bool = False
   shape_invariant_numerics: bool = True
   use_tc_tiling_on_sc: bool | None = None
-  needs_layout_passes: bool = False
+  needs_layout_passes: bool = True
+  fuse_transposed_lhs_in_matmul: bool = False
 
   def __init__(
       self,
@@ -142,14 +151,14 @@ class CompilerParams:
       flags: Mapping[str, Any] | None = None,
       internal_scratch_in_bytes: int | None = None,
       serialization_format: int = 1,
-      kernel_type: CoreType = CoreType.TC,
       disable_bounds_checks: bool = False,
       disable_semaphore_checks: bool = False,
       skip_device_barrier: bool = False,
       allow_collective_id_without_custom_barrier: bool = False,
       shape_invariant_numerics: bool = True,
       use_tc_tiling_on_sc: bool | None = None,
-      needs_layout_passes: bool | None = None,
+      needs_layout_passes: bool = True,
+      fuse_transposed_lhs_in_matmul: bool = False,
   ):
     object.__setattr__(
         self,
@@ -171,7 +180,6 @@ class CompilerParams:
         self, "internal_scratch_in_bytes", internal_scratch_in_bytes
     )
     object.__setattr__(self, "serialization_format", serialization_format)
-    object.__setattr__(self, "kernel_type", kernel_type)
     object.__setattr__(self, "disable_bounds_checks", disable_bounds_checks)
     object.__setattr__(
         self, "disable_semaphore_checks", disable_semaphore_checks
@@ -187,6 +195,11 @@ class CompilerParams:
     )
     object.__setattr__(self, "use_tc_tiling_on_sc", use_tc_tiling_on_sc)
     object.__setattr__(self, "needs_layout_passes", needs_layout_passes)
+    object.__setattr__(
+        self,
+        "fuse_transposed_lhs_in_matmul",
+        fuse_transposed_lhs_in_matmul,
+    )
 
   # Replace is a method, not a field.
   replace = dataclasses.replace
@@ -207,7 +220,17 @@ class MemorySpace(enum.Enum):
   CMEM = "cmem"
   SEMAPHORE = "semaphore_mem"
   HBM = "hbm"
-  HOST = "host"
+
+  def __getattr__(self, name):
+    if name == "HOST":
+      # Deprecated on June 4, 2026.
+      deprecations.warn(
+          "pltpu-memory-space-host",
+          "pltpu.MemorySpace.HOST is deprecated. Use pl.HOST instead.",
+          stacklevel=2,
+      )
+      return pallas_core.MemorySpace.HOST
+    super().__getattr__(name)  # pyrefly: ignore[missing-attribute]
 
   def __str__(self) -> str:
     return self.value
@@ -221,6 +244,11 @@ class MemorySpace(enum.Enum):
   def __call__(self, shape: Sequence[int], dtype: jnp.dtype[Any]):
     # A convenience function for constructing MemoryRef types of ShapedArrays.
     return self.from_type(jax_core.ShapedArray(tuple(shape), dtype))
+
+  def like(self, shape_dtype_like):
+    if isinstance(shape_dtype_like, jax_core.AbstractValue):
+      return self.from_type(shape_dtype_like)
+    return self.from_type(jax.typeof(shape_dtype_like))
 
   def __matmul__(self, other, /):
     if not isinstance(other, pallas_core.Mesh):
@@ -331,8 +359,8 @@ class TensorCoreMesh(pallas_core.Mesh):
     return collections.OrderedDict(zip(self.axis_names, self.devices.shape))
 
   @property
-  def dimension_semantics(self) -> Sequence[str]:
-    return ["parallel"]
+  def dimension_semantics(self) -> Sequence[DimensionSemantics]:
+    return [GridDimensionSemantics.PARALLEL]
 
   def discharges_effect(self, effect: jax_core.Effect) -> Literal[False]:
     del effect
@@ -352,6 +380,10 @@ class TensorCoreMesh(pallas_core.Mesh):
         MemorySpace.CMEM,
         MemorySpace.SEMAPHORE,
     ]
+
+  @contextlib.contextmanager
+  def tracing_context(self):
+    yield
 
 
 def create_tensorcore_mesh(
@@ -438,7 +470,7 @@ def pass_scalars_as_refs(
     if copy_to_smem:
       smem, args = util.split_list(args, [len(smem_alloc)])
       assert len(smem) == len(scalar_const_refs)
-      from jax._src.pallas.mosaic.helpers import sync_copy
+      from jax._src.pallas.mosaic.helpers import sync_copy  # pyrefly: ignore[missing-import]
 
       sync_copy(scalar_const_refs, smem)
     else:
@@ -587,10 +619,8 @@ def memory_space_to_tpu_memory_space(
           return MemorySpace.SMEM
         case _:
           raise ValueError(f"Unsupported core type: {core_type}")
-    case pallas_core.MemorySpace.ANY:
-      return pallas_core.MemorySpace.ANY
-    case pallas_core.MemorySpace.HOST:
-      return MemorySpace.HOST
+    case pallas_core.MemorySpace.ANY | pallas_core.MemorySpace.HOST:
+      return memory_space
     case (
         pallas_core.MemorySpace.ERROR
         | pallas_core.MemorySpace.INDEX

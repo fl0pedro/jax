@@ -96,7 +96,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
       kv = jnp.pad(
           kv,
-          ((0, pl.cdiv(kv_len, page_size) * page_size - kv_len), (0, 0), (0, 0)),
+          ((0, pl.align_to(kv_len, page_size) - kv_len), (0, 0), (0, 0)),
           constant_values=jnp.nan,
       ).reshape(-1, page_size, num_kv_heads * 2, head_dim)
       indices = page_cnt + jnp.arange(kv.shape[0], dtype=jnp.int32)
@@ -208,6 +208,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
   ):
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("Expect TPUv5+")
+    if not jtu.is_cloud_tpu_at_least(2026, 6, 1):
+      self.skipTest("float8 quantized kv cache requires newer libtpu on Cloud TPU")
     seq_lens = [(192, 328), (128, 180), (64, 255)]
     num_heads = (32, 8)
     head_dim = 128

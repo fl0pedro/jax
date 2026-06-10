@@ -29,7 +29,7 @@ Usage::
   #
   # Returns:
   #   (f32[qy_size, k], i32[qy_size, k])
-  @functools.partial(jax.jit, static_argnames=["k", "recall_target"])
+  @jax.jit(static_argnames=["k", "recall_target"])
   def mips(qy, db, k=10, recall_target=0.95):
     dists = jax.lax.dot(qy, db.transpose())
     # Computes max_k along the last dimension
@@ -128,7 +128,7 @@ def approx_max_k(operand: Array,
   >>> import functools
   >>> import jax
   >>> import numpy as np
-  >>> @functools.partial(jax.jit, static_argnames=["k", "recall_target"])
+  >>> @jax.jit(static_argnames=["k", "recall_target"])
   ... def mips(qy, db, k=10, recall_target=0.95):
   ...   dists = jax.lax.dot(qy, db.transpose())
   ...   # returns (f32[qy_size, k], i32[qy_size, k])
@@ -187,7 +187,7 @@ def approx_min_k(operand: Array,
   >>> import functools
   >>> import jax
   >>> import numpy as np
-  >>> @functools.partial(jax.jit, static_argnames=["k", "recall_target"])
+  >>> @jax.jit(static_argnames=["k", "recall_target"])
   ... def l2_ann(qy, db, half_db_norms, k=10, recall_target=0.95):
   ...   dists = half_db_norms - jax.lax.dot(qy, db.transpose())
   ...   return jax.lax.approx_min_k(dists, k=k, recall_target=recall_target)
@@ -313,16 +313,19 @@ def _approx_top_k_lowering(ctx, operand, *, k,
   if all(core.is_constant_shape(aval_out.shape) for aval_out in ctx.avals_out):
     result_shapes = None
   else:
-    result_shapes = mlir.flatten_ir_values(
-        mlir.shape_tensor(mlir.eval_dynamic_shape(ctx, aval_out.shape))
+    result_shapes, _ = mlir.ir_tree_registry.flatten([
+        mlir.shape_tensor(ctx.module_context, mlir.eval_dynamic_shape(ctx, aval_out.shape))
         for aval_out in ctx.avals_out
-    )
+    ])
 
+  flat_res_types, _ = mlir.ir_tree_registry.flatten([
+      mlir.aval_to_ir_types(ctx.module_context, a) for a in ctx.avals_out
+  ])
   if core.is_constant_dim(k):
     backend_config["top_k"] = mlir.i64_attr(k)
     out = mlir.custom_call(
         "ApproxTopK",
-        result_types=mlir.flatten_ir_types(map(mlir.aval_to_ir_types, ctx.avals_out)),
+        result_types=flat_res_types,
         operands=[operand, iota, *init_vals, init_arg],
         called_computations=[comparator.name.value],
         backend_config=backend_config,
@@ -331,7 +334,7 @@ def _approx_top_k_lowering(ctx, operand, *, k,
     k_value, = mlir.eval_dynamic_shape_as_vals(ctx, (k,))
     out = mlir.custom_call(
         "stablehlo.dynamic_approx_top_k",
-        result_types=mlir.flatten_ir_types(map(mlir.aval_to_ir_types, ctx.avals_out)),
+        result_types=flat_res_types,
         operands=[operand, iota, *init_vals, init_arg, k_value],
         called_computations=[comparator.name.value],
         backend_config=backend_config,

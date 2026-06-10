@@ -44,6 +44,7 @@ concurrency:
 
 jobs:
   build-jax-artifact:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/build_artifacts.yml
     name: "Build jax artifact"
     with:
@@ -55,6 +56,7 @@ jobs:
         gcs_upload_uri: 'gs://general-ml-ci-transient/jax-github-actions/jax/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}'
 
   build-jaxlib-artifact:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/build_artifacts.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -76,6 +78,7 @@ jobs:
         gcs_upload_uri: 'gs://general-ml-ci-transient/jax-github-actions/jax/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}'
 
   build-cuda-artifacts:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/build_artifacts.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -96,10 +99,7 @@ jobs:
       gcs_upload_uri: 'gs://general-ml-ci-transient/jax-github-actions/jax/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}'
 
   run-pytest-cpu:
-    # Run test jobs even if the build job fails. Avoids losing test coverage if a single unrelated
-    # build job fails. E.g Windows build job fails but everything else succeeds. In this case, we
-    # still want to run the tests for other platforms.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.repository_owner == 'jax-ml' }}
     needs: [build-jax-artifact, build-jaxlib-artifact]
     uses: ./.github/workflows/pytest_cpu.yml
     strategy:
@@ -118,10 +118,7 @@ jobs:
       gcs_download_uri: ${{ needs.build-jaxlib-artifact.outputs.gcs_upload_uri }}
 
   run-pytest-cuda:
-    # Run test jobs even if the build job fails. Avoids losing test coverage if a single unrelated
-    # build job fails. E.g Windows build job fails but everything else succeeds. In this case, we
-    # still want to run the tests for other platforms.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.repository_owner == 'jax-ml' }}
     needs: [build-jax-artifact, build-jaxlib-artifact, build-cuda-artifacts]
     uses: ./.github/workflows/pytest_cuda.yml
     strategy:
@@ -162,6 +159,7 @@ jobs:
       gcs_download_uri: ${{ needs.build-jaxlib-artifact.outputs.gcs_upload_uri }}
 
   run-bazel-test-cpu-py-import:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/bazel_cpu.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -179,10 +177,7 @@ jobs:
       clone_main_xla: 1
 
   run-bazel-test-cuda:
-    # Run test jobs even if the build job fails. Avoids losing test coverage if a single unrelated
-    # build job fails. E.g Windows build job fails but everything else succeeds. In this case, we
-    # still want to run the tests for other platforms.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.repository_owner == 'jax-ml' }}
     needs: [build-jax-artifact, build-jaxlib-artifact, build-cuda-artifacts]
     uses: ./.github/workflows/bazel_cuda.yml
     strategy:
@@ -211,10 +206,7 @@ jobs:
       clone_main_xla: 1
 
   run-bazel-test-cuda-py-import:
-    # Run test jobs even if the build job fails. Avoids losing test coverage if a single unrelated
-    # build job fails. E.g Windows build job fails but everything else succeeds. In this case, we
-    # still want to run the tests for other platforms.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.repository_owner == 'jax-ml' }}
     uses: ./.github/workflows/bazel_cuda.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -239,10 +231,7 @@ jobs:
       clone_main_xla: 1
 
   run-pytest-tpu:
-    # Run test jobs even if the build job fails. Avoids losing test coverage if a single unrelated
-    # build job fails. E.g Windows build job fails but everything else succeeds. In this case, we
-    # still want to run the tests for other platforms.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.repository_owner == 'jax-ml' }}
     needs: [build-jax-artifact, build-jaxlib-artifact]
     uses: ./.github/workflows/pytest_tpu.yml
     strategy:
@@ -255,7 +244,7 @@ jobs:
             {type: "v6e-8", cores: "8", runner: "linux-x86-ct6e-180-8tpu"},
             {type: "v7x-8", cores: "4", runner: "linux-x86-tpu7x-224-4tpu"}
           ]
-          libtpu-version-type: ["nightly"]
+          libtpu-version-type: ["pinned"]
     name: "Pytest TPU (JAX artifacts version = ${{ format('{0}', 'head') }})"
     with:
       runner: ${{ matrix.tpu-specs.runner }}
@@ -267,10 +256,7 @@ jobs:
       gcs_download_uri: ${{ needs.build-jaxlib-artifact.outputs.gcs_upload_uri }}
 
   run-bazel-test-tpu:
-    # Run test jobs even if the build job fails. Avoids losing test coverage if a single unrelated
-    # build job fails. E.g Windows build job fails but everything else succeeds. In this case, we
-    # still want to run the tests for other platforms.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.repository_owner == 'jax-ml' }}
     uses: ./.github/workflows/bazel_test_tpu.yml
     needs: [build-jaxlib-artifact]
     strategy:
@@ -282,7 +268,7 @@ jobs:
             {type: "v5e-8", cores: "8", runner: "linux-x86-ct5lp-224-8tpu"},
             {type: "v7x-8", cores: "4", runner: "linux-x86-tpu7x-224-4tpu"},
           ]
-          libtpu-version-type: ["nightly"]
+          libtpu-version-type: ["pinned"]
     name: "Bazel tests TPU (JAX artifacts version = ${{ format('{0}', 'head') }})"
     with:
       runner: ${{ matrix.tpu-specs.runner }}
@@ -297,6 +283,7 @@ jobs:
       clone_main_xla: 1
 
   build-rocm-artifacts:
+    if: github.repository_owner == 'jax-ml' || github.repository_owner == 'ROCm'
     uses: ./.github/workflows/build_rocm_artifacts.yml
     permissions:
       id-token: write
@@ -308,7 +295,9 @@ jobs:
           runner: ["linux-x86-64-1gpu-amd"]
           artifact: ["jax-rocm-plugin", "jax-rocm-pjrt"]
           python: ["3.11", "3.12", "3.13", "3.14"]
-          rocm-version: ["7"]
+          rocm: [
+            {label: "ROCm 7.2.0", wheel-version: "7", release-version: "7.2.0", manylinux-image: ""},
+          ]
           exclude:
             - artifact: "jax-rocm-pjrt"
               python: "3.12"
@@ -316,18 +305,20 @@ jobs:
               python: "3.13"
             - artifact: "jax-rocm-pjrt"
               python: "3.14"
-    name: "Build ${{ format('{0}', 'ROCm') }} artifacts"
+    name: "Build ROCm artifacts (${{ matrix.rocm.label }})"
     with:
       runner: ${{ matrix.runner }}
       artifact: ${{ matrix.artifact }}
       python: ${{ matrix.python }}
-      rocm-version: ${{ matrix.rocm-version }}
+      rocm-version: ${{ matrix.rocm.wheel-version }}
+      rocm-release-version: ${{ matrix.rocm.release-version }}
+      manylinux-image: ${{ matrix.rocm.manylinux-image }}
       clone_main_xla: 1
       upload_artifacts_to_s3: true
-      s3_upload_uri: 's3://jax-ci-amd/rocm-wheels/wheel-tests-continuous/${{ github.run_number }}/${{ github.run_attempt }}'
+      s3_upload_uri: 's3://jax-ci-amd/rocm-wheels/${{ github.repository }}/${{ github.ref_name }}/${{ matrix.rocm.release-version }}/wheel-tests-continuous/${{ github.run_number }}/${{ github.run_attempt }}'
 
   run-pytest-rocm:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.repository_owner == 'jax-ml' || github.repository_owner == 'ROCm') }}
     needs: [build-jax-artifact, build-jaxlib-artifact, build-rocm-artifacts]
     uses: ./.github/workflows/pytest_rocm.yml
     permissions:
@@ -340,20 +331,21 @@ jobs:
           runner: ["linux-x86-64-1gpu-amd", "linux-x86-64-4gpu-amd", "linux-x86-64-8gpu-amd"]
           python: ["3.11"]
           rocm: [
-            {version: "7.2.0", tag: "rocm720"},
+            {label: "ROCm 7.2.0", wheel-version: "7", release-version: "7.2.0", tag: "rocm720"},
           ]
-    name: "Pytest ROCm (JAX artifacts version = ${{ format('{0}', 'head') }})"
+    name: "Pytest ROCm (${{ matrix.rocm.label }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
-      rocm-version: ${{ matrix.rocm.version }}
+      rocm-version: ${{ matrix.rocm.wheel-version }}
+      rocm-release-version: ${{ matrix.rocm.release-version }}
       rocm-tag: ${{ matrix.rocm.tag }}
       jaxlib-version: "head"
-      gcs_download_uri: ${{ needs.build-jaxlib-artifact.outputs.gcs_upload_uri }}
-      s3_download_uri: 's3://jax-ci-amd/rocm-wheels/wheel-tests-continuous/${{ github.run_number }}/${{ github.run_attempt }}'
+      gcs_download_uri: ${{ needs.build-jaxlib-artifact.outputs.gcs_upload_uri || 'gs://jax-nightly-artifacts/latest' }}
+      s3_download_uri: 's3://jax-ci-amd/rocm-wheels/${{ github.repository }}/${{ github.ref_name }}/${{ matrix.rocm.release-version }}/wheel-tests-continuous/${{ github.run_number }}/${{ github.run_attempt }}'
 
   run-bazel-test-rocm:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.repository_owner == 'jax-ml' || github.repository_owner == 'ROCm') }}
     needs: [build-jax-artifact, build-jaxlib-artifact, build-rocm-artifacts]
     uses: ./.github/workflows/bazel_rocm.yml
     permissions:
@@ -365,15 +357,20 @@ jobs:
         matrix:
           runner: ["linux-x86-64-4gpu-amd", "linux-x86-64-8gpu-amd"]
           python: ["3.11"]
-          rocm-version: ["7"]
+          rocm: [
+            {label: "ROCm 7.2.0", wheel-version: "7", release-version: "7.2.0", tag: "rocm720"},
+          ]
           enable-x64: [0]
-    name: "Bazel ROCm tests (JAX artifacts version = ${{ format('{0}', 'head') }})"
+    name: "Bazel ROCm (${{ matrix.rocm.label }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
-      rocm-version: ${{ matrix.rocm-version }}
+      rocm-version: ${{ matrix.rocm.wheel-version }}
+      rocm-release-version: ${{ matrix.rocm.release-version }}
+      rocm-tag: ${{ matrix.rocm.tag }}
       enable-x64: ${{ matrix.enable-x64 }}
-      gcs_download_uri: ${{ needs.build-jaxlib-artifact.outputs.gcs_upload_uri }}
+      gcs_download_uri: ${{ needs.build-jaxlib-artifact.outputs.gcs_upload_uri || 'gs://jax-nightly-artifacts/latest' }}
+      s3_download_uri: 's3://jax-ci-amd/rocm-wheels/${{ github.repository }}/${{ github.ref_name }}/${{ matrix.rocm.release-version }}/wheel-tests-continuous/${{ github.run_number }}/${{ github.run_attempt }}'
       build_jaxlib: ${{ 'false' }}
       build_jax: ${{ 'false' }}
       jaxlib-version: "head"

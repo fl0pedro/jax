@@ -42,6 +42,7 @@ import weakref
 
 from absl import logging
 from absl.testing import absltest, parameterized
+
 import jax
 from jax import device_put, float0, grad, hessian, jacfwd, jacrev, jit
 from jax import lax
@@ -61,6 +62,8 @@ from jax._src.ad_checkpoint import saved_residuals, remat3, checkpoint_name3
 from jax._src.interpreters import ad as ad_internal
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
+from jax._src.lax.eval_jaxpr import eval_jaxpr_p
+from jax._src.lib import jaxlib_extension_version
 from jax._src.compilation_cache import is_persistent_cache_enabled
 from jax._src.sharding_impls import make_single_device_sharding
 import jax._src.util as jax_util
@@ -764,7 +767,7 @@ class JitTest(jtu.BufferDonationTestCase):
 
     class A:
 
-      @functools.partial(jit, static_argnums=(0,))
+      @jit(static_argnums=(0,))
       def my_func_jit(self, x):
         return x+2
 
@@ -775,7 +778,7 @@ class JitTest(jtu.BufferDonationTestCase):
 
       class A:
 
-        @functools.partial(jit, static_argnums=(0,))
+        @jit(static_argnums=(0,))
         @classmethod
         def my_classmethod_jit(cls, x):
           return x+2
@@ -786,7 +789,7 @@ class JitTest(jtu.BufferDonationTestCase):
 
       class A:
 
-        @functools.partial(jit)
+        @jit
         @staticmethod
         def my_staticmethod_jit(x):
           return x + 2
@@ -2916,6 +2919,18 @@ class APITest(jtu.JaxTestCase):
 
     self.assertEqual(out_shape.shape, (2, 4))
 
+  def test_eval_shape_nested_jit_sds(self):
+    @jit
+    def inner(x):
+      return x + 1
+
+    def outer():
+      sds = api.ShapeDtypeStruct((), jnp.float32)
+      return inner(sds)
+
+    out_shape = api.eval_shape(outer)
+    self.assertEqual(out_shape.shape, ())
+
   def test_eval_shape_tuple_unpacking(self):
     def fun(x, y):
       a, b = x
@@ -3008,6 +3023,16 @@ class APITest(jtu.JaxTestCase):
     out_shape = api.eval_shape(lambda x: x, x)  # doesn't crash
     self.assertEqual(out_shape.shape, (3,))
 
+  def test_eval_shape_error_bad_output(self):
+    def f(x):
+      return (2.0, f)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        r'function f at .*returned a value.*'
+        r'at output component \[1\], which is not a valid JAX type'):
+      api.eval_shape(f, 1)
+
   def test_issue_871(self):
     T = jnp.array([[1., 2.], [3., 4.], [5., 6.]])
     x = jnp.array([1, 2, 3])
@@ -3021,6 +3046,11 @@ class APITest(jtu.JaxTestCase):
     y, f_jvp = api.linearize(api.jit(jnp.sum), x)
     with self.assertRaisesRegex(ValueError, msg):
       f_jvp(T)
+
+  def test_linearize_instantiates_zero_outputs(self):
+    _, f_lin = api.linearize(lambda x: (x, 1.), 3.)
+    _, y = f_lin(1.)
+    self.assertAllClose(y + 1, 1, check_dtypes=False)  # don't crash
 
   def test_grad_of_int_errors(self):
     # Errors without allow_int=True
@@ -3348,6 +3378,8 @@ class APITest(jtu.JaxTestCase):
     check(lambda: jnp.arange(1.0).astype("int64"),
           lambda: jnp.arange(1.0).astype(int))
 
+  @unittest.skipIf(jaxlib_extension_version < 465,
+                   "wrong error for older jaxlib")
   def test_error_for_invalid_dtype(self):
     err_str = (
         "Error interpreting argument to .* as a JAX value. The problematic "
@@ -3793,6 +3825,15 @@ class APITest(jtu.JaxTestCase):
     with self.assertRaisesRegex(
         UnexpectedTracerError, "Encountered an unexpected tracer"):
       api.jit(lambda x: self._saved_tracer)(0.)
+
+  def test_tree_map_rest_prefix_err(self):
+    x = {"a": 1, "b": 2, "c": [1, 2], "d": 4}
+    y = {"a": 1, "b": 2, "c": None, "d": {"d1": 4.1, "d2": 4.2}}
+    with self.assertRaisesRegex(ValueError, "pytree structure error"):
+      jax.tree.map(lambda x, y: (x, y), x, y, is_leaf=lambda x: x is None)
+    with self.assertRaisesRegex(ValueError, "pytree structure error"):
+      jax.tree_util.tree_map_with_path(lambda path, x, y: (x, y), x, y,
+                                      is_leaf=lambda x: x is None)
 
   def test_escaped_tracers_cant_lift_sublevels(self):
     api.jit(self.helper_save_tracer)(0.)
@@ -4948,12 +4989,11 @@ class APITest(jtu.JaxTestCase):
           with jax.default_matmul_precision("high"):
             f(0., 1.)
 
-    expected_log_len = 1 if not is_persistent_cache_enabled() else 3
-    self.assertTrue(1 <= len(cm.output) <= expected_log_len)
     msg = cm.output[0]
     self.assertIn("racing context", msg)
-    # self.assertIn("now warn and before", msg)
-    # self.assertIn("now high and before", msg)
+    if jaxlib_extension_version >= 455:
+      self.assertIn("now warn and before", msg)
+      self.assertIn("now high and before", msg)
     self.assertNotIn("explanation unavailable!", msg)
 
   @unittest.skip('TODO(mattjj): re-enable after updating cache miss explainer')
@@ -5352,6 +5392,21 @@ class APITest(jtu.JaxTestCase):
           f(1.)
     self.assertEqual(tracing_count(), 4)
 
+  @jtu.thread_unsafe_test()  # make_user_context() is not thread-safe at the moment
+  def test_user_context_global(self):
+    my_config = jax.make_user_context()
+
+    @jax.jit
+    def f(x):
+      return x
+
+    prev_val = my_config.get_global()
+    try:
+      my_config.set_global(2)
+      self.assertEqual(my_config.get_global(), 2)
+    finally:
+      my_config.set_global(prev_val)
+
   # TODO(mattjj,dougalm): re-enable if we set auto_dce=True by default
   # @jtu.run_on_devices('cpu')
   # def test_implicit_dce(self):
@@ -5426,6 +5481,24 @@ class APITest(jtu.JaxTestCase):
     self.assertEqual(x_grad, jax.ad.DidntWant())
     self.assertAllClose(y_grad, x)
     self.assertLen(g.trace().jaxpr.eqns, 1)
+
+  def test_while_jvp_debug_info_crash(self):
+    def loop_fun(x, p):
+      cond = lambda val: val[0] < 3
+      body = lambda val: (val[0] + 1, val[1] * p)
+      _, res = jax.lax.while_loop(cond, body, (0, x))
+      return jax.lax.stop_gradient(res)
+
+    def inner_grad(p):
+      return jax.grad(lambda param: loop_fun(1.0, param))(p)
+
+    vmapped_inner_grad = jax.vmap(inner_grad)
+
+    def outer_fun(p_vector):
+      grads = vmapped_inner_grad(p_vector)
+      return jnp.sum(grads)
+
+    jax.grad(outer_fun)(jnp.array([2.0, 3.0]))  # don't crash
 
 
 class RematTest(jtu.JaxTestCase):
@@ -8051,7 +8124,7 @@ class TracebackTest(jtu.JaxTestCase):
 
   def test_grad_traceback(self):
     # TODO(dougalm): improve this
-    expected_depth = 11
+    expected_depth = 9
     init_depth = self.cur_depth()
 
     def foo(x):
@@ -8074,7 +8147,7 @@ class TracebackTest(jtu.JaxTestCase):
   def test_custom_vjp_traceback(self):
     # TODO(dougalm): improve this
     expected_depth_f = 7 if config.custom_vjp3.value else 9
-    expected_depth_f_fwd = 18
+    expected_depth_f_fwd = 16
     expected_depth_f_rev = 12
     init_depth = self.cur_depth()
     @jax.custom_vjp
@@ -8091,6 +8164,48 @@ class TracebackTest(jtu.JaxTestCase):
 
     f(1.0)
     grad(f)(1.0)
+
+
+class EvalJaxprPrimitiveTest(jtu.JaxTestCase):
+  """Tests for eval_jaxpr_p and its transformation rules."""
+
+  def _bind_eval_jaxpr(self, f, *args):
+    """Trace f into a jaxpr and evaluate it via eval_jaxpr_p.bind."""
+    closed_jaxpr = jax.make_jaxpr(f)(*args)
+    return eval_jaxpr_p.bind(*args, jaxpr=closed_jaxpr)
+
+  def test_eval_jaxpr_impl(self):
+    def f(x, y):
+      return [x * y + 1.0]
+    x, y = jnp.array(3.0), jnp.array(4.0)
+    [result] = self._bind_eval_jaxpr(f, x, y)
+    self.assertAllClose(result, x * y + 1.0)
+
+  def test_eval_jaxpr_jvp(self):
+    def g(x):
+      return self._bind_eval_jaxpr(lambda x: [x ** 3], x)[0]
+    x = jnp.array(2.0)
+    primals, tangents = jax.jvp(g, (x,), (jnp.ones_like(x),))
+    self.assertAllClose(primals, x ** 3)
+    self.assertAllClose(tangents, 3.0 * x ** 2)
+
+  def test_eval_jaxpr_grad(self):
+    def g(x):
+      return self._bind_eval_jaxpr(lambda x: [x ** 3], x)[0]
+    x = jnp.array(2.0)
+    self.assertAllClose(jax.grad(g)(x), 3.0 * x ** 2)
+
+  def test_eval_jaxpr_vmap(self):
+    def g(x):
+      return self._bind_eval_jaxpr(lambda x: [x ** 2 + 1.0], x)[0]
+    xs = jnp.array([1.0, 2.0, 3.0])
+    self.assertAllClose(jax.vmap(g)(xs), xs ** 2 + 1.0)
+
+  def test_eval_jaxpr_jit(self):
+    def g(x):
+      return self._bind_eval_jaxpr(lambda x: [jnp.sin(x)], x)[0]
+    x = jnp.array(1.0)
+    self.assertAllClose(jax.jit(g)(x), jnp.sin(x))
 
 
 if __name__ == '__main__':

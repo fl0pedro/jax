@@ -249,15 +249,19 @@ def matmul(a, b, c, config: TuningConfig):
 
   num_sms = backend.get_default_device().core_count
   cluster_size = 1 + (config.cluster_dimension is not None)
+  compiler_params = plgpu.CompilerParams(
+      lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+  )
   f = plgpu.kernel(
       functools.partial(kernel, config=config),
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      out_type=jax.ShapeDtypeStruct((m, n), out_dtype),
       grid=(num_sms // cluster_size,),
       grid_names=("cluster_grid",),
       cluster=(cluster_size,),
       cluster_names=("cluster",),
       num_threads=3,
       thread_name="wg",
+      compiler_params=compiler_params,
   )
   return f(a, b, c)
 

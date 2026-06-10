@@ -604,6 +604,15 @@ class CheckpointTest(jtu.JaxTestCase):
     else:
       self.assertEqual(spec['kvstore']['base']['path'], expected_path)
 
+  def test_get_tensorstore_spec_ocdbt_s3_path(self):
+    path = 's3://my-bucket/ckpt/dir/array_name'
+    spec = ts_impl.get_tensorstore_spec(path, ocdbt=True)
+
+    self.assertEqual(spec['kvstore']['base']['driver'], 's3')
+    self.assertEqual(spec['kvstore']['base']['bucket'], 'my-bucket')
+    self.assertEqual(spec['kvstore']['base']['path'], 'ckpt/dir')
+    self.assertEqual(spec['kvstore']['path'], 'array_name')
+
   def test_get_tensorstore_spec_not_absolute_path(self):
     path = 'my/ckpt/path'
     with self.assertRaisesRegex(ValueError,
@@ -1048,8 +1057,7 @@ class UserPytreeAPITest(UserAPITestCase):
             7 * jnp.ones(())]
     tree_save(data, path)
     pytreedef = tree_load_pytreedef(path)
-    expected_pytreedef = jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), data)
+    expected_pytreedef = jax.tree.map(jax.ShapeDtypeStruct.like, data)
     self.assertPyTreeEqual(pytreedef, expected_pytreedef)
 
   @parameterized.product(data=[

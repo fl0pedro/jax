@@ -15,11 +15,11 @@
 # AMD HIP kernels
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_python//python:defs.bzl", "py_library")
 load(
     "//jaxlib:jax.bzl",
     "if_rocm_is_configured",
     "jax_bzl_library",
+    "py_library",
     "rocm_library",
 )
 load("//jaxlib/rocm:rocm_rpath.bzl", "rocm_nanobind_extension")
@@ -442,6 +442,7 @@ cc_library(
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/hash",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",

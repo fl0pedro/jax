@@ -276,6 +276,23 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "xla_transform_test",
+    srcs = ["xla_transform_test.py"],
+    enable_backends = [
+        "cpu",
+        "tpu",
+    ],
+    deps = [
+        "//jax/extend:xla",
+        "//jaxlib:_xla",
+        "@xla//xla/python:_hlo",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "ffi_test",
     srcs = ["ffi_test.py"],
     enable_configs = [
@@ -387,6 +404,7 @@ jax_multiplatform_test(
     tags = ["multiaccelerator"],
     deps = [
         "//jax/experimental:compute_on",
+        "//jax/experimental:pallas_mosaic_gpu",
     ] + py_deps([
         "absl/testing",
         "numpy",
@@ -992,6 +1010,9 @@ jax_multiplatform_test(
             "nomsan",
             "notsan",  # Times out.
         ],  # TODO(phawkins): Latest SciPy leaks memory.
+        "gpu": [
+            "noasan",  # Times out.
+        ],
     },
     shard_count = {
         "cpu": 40,
@@ -1011,6 +1032,7 @@ jax_multiplatform_test(
     shard_count = 10,
     tags = [
         "noasan",  # Times out under asan.
+        "notsan",  # Times out under tsan.
     ],
     deps = py_deps([
         "absl/testing",
@@ -1214,9 +1236,7 @@ jax_multiplatform_test(
         "tpu",
     ],
     tags = ["multiaccelerator"],
-    deps = [
-        "//jax/_src:profiler",
-    ] + py_deps([
+    deps = ["//jax/_src:profiler"] + py_deps([
         "absl/testing",
         "portpicker",
     ]),
@@ -1273,6 +1293,15 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "random_test",
     srcs = ["random_test.py"],
+    deps = py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "random_impl_test",
+    srcs = ["random_impl_test.py"],
     deps = py_deps([
         "absl/testing",
         "numpy",
@@ -1918,6 +1947,18 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "control_deps_test",
+    srcs = ["control_deps_test.py"],
+    tags = ["multiaccelerator"],
+    deps = [
+        "//jax/experimental:control_deps",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "async_collectives_test",
     srcs = ["async_collectives_test.py"],
     tags = ["multiaccelerator"],
@@ -2241,6 +2282,15 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "scaled_dot_test",
     srcs = ["scaled_dot_test.py"],
+    # This test runs OOM on a part of B200; we overwrite the config to run on the full machine.
+    config_tags_overrides = {
+        "gpu_b200_full": {
+            "manual": False,
+            "notap": False,
+            "disabled": False,
+        },
+    },
+    disable_configs = ["gpu_b200"],
     shard_count = 5,
     deps = py_deps([
         "absl/testing",
@@ -2254,6 +2304,18 @@ jax_multiplatform_test(
         "//jax/_src:typing",
         "//jax/_src/lib",
     ],
+)
+
+jax_multiplatform_test(
+    name = "local_wheel_smoke_test",
+    srcs = ["local_wheel_smoke_test.py"],
+    enable_backends = ["gpu"],
+    tags = [
+        "local",
+        "manual",
+        "notap",
+    ],
+    deps = py_deps("absl/testing"),
 )
 
 jax_py_test(
@@ -2327,5 +2389,16 @@ jax_py_test(
     ] + py_deps([
         "absl/testing",
         "hypothesis",
+    ]),
+)
+
+jax_py_test(
+    name = "hardware_utils_test",
+    srcs = ["hardware_utils_test.py"],
+    deps = [
+        "//jax",
+        "//jax/_src:test_util",
+    ] + py_deps([
+        "absl/testing",
     ]),
 )

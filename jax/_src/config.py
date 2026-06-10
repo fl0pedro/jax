@@ -30,13 +30,15 @@ from jax._src.lib import _jax
 from jax._src.lib import guard_lib
 from jax._src.lib import jax_jit
 from jax._src.lib import xla_client
+from jax._src.lib import jaxlib_extension_version
 
-config_ext = xla_client._xla.config
+config_ext = _jax.config
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
 _ET = TypeVar('_ET', bound=enum.Enum)
+_F = TypeVar('_F', bound=Callable[..., Any])
 
 class EffortLevel(enum.Enum):
   """Effort level enum, mirroring the XLA effort options."""
@@ -222,6 +224,13 @@ class Config:
 register_trace_context_callback = []
 
 trace_context = config_ext.trace_context
+if jaxlib_extension_version >= 455:
+  trace_context_names = config_ext.trace_context_names
+else:
+  def trace_context_names():
+    raise NotImplementedError(
+        'trace_context_names is not supported in this JAX version.'
+    )
 
 config = Config()
 
@@ -271,6 +280,10 @@ class State(config_ext.Config[_T]):
       self._update_global_hook(default)
     config_states[name] = self
 
+  @property
+  def name(self):
+    return self._name
+
   def __bool__(self) -> NoReturn:
     raise TypeError(
         "bool() not supported for instances of type '{0}' "
@@ -296,7 +309,7 @@ class State(config_ext.Config[_T]):
     update_global_hook(self.get_global())
 
 
-class StateContextManager(contextlib.ContextDecorator):
+class StateContextManager:
   __slots__ = ['state', 'new_val', 'prev']
 
   def __init__(self, state, new_val):
@@ -316,7 +329,6 @@ class StateContextManager(contextlib.ContextDecorator):
     else:
       self.new_val = new_val
 
-
   def __enter__(self):
     self.prev = self.state.swap_local(self.new_val)
     if self.state._update_thread_local_hook:
@@ -329,6 +341,13 @@ class StateContextManager(contextlib.ContextDecorator):
         self.state._update_thread_local_hook(None)
       else:
         self.state._update_thread_local_hook(cast(Optional[Any], self.prev))
+
+  def __call__(self, func: _F) -> _F:
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+      with StateContextManager(self.state, self.new_val):
+        return func(*args, **kwargs)
+    return cast(_F, wrapper)
 
 
 UPGRADE_BOOL_HELP = (
@@ -984,17 +1003,6 @@ pallas_tpu_interpret_mode_context_manager = config_ext.Config(
     include_in_trace_context=True,
 )
 
-class UserConfig:
-  def __init__(self, default_value):
-    self._obj = config_ext.Config("user_context", default_value, include_in_jit_key=True,
-                                  include_in_trace_context=True)
-
-  @property
-  def value(self):
-    return self._obj.value
-
-  def __call__(self, new_value):
-    return UserContext(self._obj, new_value)
 
 class UserContext:
   __slots__ = ["_config", "_new_value", "_prev_value"]
@@ -1009,6 +1017,27 @@ class UserContext:
   def __exit__(self, exc_type, exc_val, exc_tb):
     self._config.set_local(self._prev_value)
 
+
+class UserConfig:
+  def __init__(self, default_value):
+    self._obj = config_ext.Config(
+        "user_context", default_value, include_in_jit_key=True,
+        include_in_trace_context=True)
+
+  @property
+  def value(self):
+    return self._obj.value
+
+  def get_global(self):
+    return self._obj.get_global()
+
+  def set_global(self, new_value):
+    return self._obj.set_global(new_value)
+
+  def __call__(self, new_value):
+    return UserContext(self._obj, new_value)
+
+
 def make_user_context(default_value=None):
   """Creates a `jax.jit` cache sensitive context.
 
@@ -1016,8 +1045,9 @@ def make_user_context(default_value=None):
   cache won't get a hit and the jitted function will be re-traced, re-lowered
   and re-compiled.
 
-  This function is not thread-safe. Do not call it concurrently with other JAX
-  APIs.
+  Adding new user contexts is not thread-safe. Do not call make_user_context
+  concurrently with other JAX APIs. However, using a user context once it has
+  been constructed is thread-safe.
 
   Example:
 
@@ -1033,8 +1063,7 @@ def make_user_context(default_value=None):
     f(1.)  # tracing cache miss
   ```
   """
-  obj = UserConfig(default_value)
-  return obj
+  return UserConfig(default_value)
 
 
 # TODO(b/214340779): remove flag when XLA:CPU is improved.
@@ -1181,6 +1210,11 @@ captured_constants_report_frames = int_state(
     )
 )
 
+debug_leaked_clients_on_clear_backends = bool_state(
+    name='jax_debug_leaked_clients_on_clear_backends',
+    default=False,
+    help=('Check that clear_backends actually clears the backends.'))
+
 debug_nans = bool_state(
     name='jax_debug_nans',
     default=False,
@@ -1277,7 +1311,7 @@ enable_custom_prng = bool_state(
 
 default_prng_impl = enum_state(
     name='jax_default_prng_impl',
-    enum_values=['threefry2x32', 'rbg', 'unsafe_rbg'],
+    enum_values=['threefry2x32', 'threefry4x32', 'rbg', 'unsafe_rbg', 'philox2x32', 'philox4x32'],
     default='threefry2x32',
     help=('Select the default PRNG implementation, used when one is not '
           'explicitly provided at seeding time.'))
@@ -1415,11 +1449,14 @@ hlo_source_file_canonicalization_regex = optional_string_state(
     default=None,
     help=('Used to canonicalize the source_path metadata of HLO instructions '
           'by removing the given regex. If set, re.sub() is called on each '
-          'source_file with the given regex, and all matches are removed. '
-          'This can be used to avoid spurious cache misses when using the '
-          'persistent compilation cache, which includes HLO metadata in the '
-          'cache key.'),
+          'source_file with the given regex, and all matches are removed.'),
     include_in_trace_context=True)
+
+source_url_schema = optional_string_state(
+    name='jax_source_url_schema',
+    default=None,
+    help=('URL format string used to generate links to source files in the HTML'
+          ' jaxpr dumps. Can contain `{file}` and `{line}` placeholders.'))
 
 include_full_tracebacks_in_locations = bool_state(
     name='jax_include_full_tracebacks_in_locations',
@@ -1431,7 +1468,7 @@ include_full_tracebacks_in_locations = bool_state(
 
 traceback_in_locations_limit = int_state(
     name='jax_traceback_in_locations_limit',
-    default=10,
+    default=100,
     help=(
         'Limit the number of frames at the Python traceback frames included in '
         'MLIR locations. If set to the negative value, traceback will not be '
@@ -1698,6 +1735,13 @@ numpy_rank_promotion = enum_state(
     include_in_jit_key=True,
     include_in_trace_context=True)
 
+auto_pcast = bool_state(
+    name='jax_auto_pcast',
+    default=True,  # TODO(yashkatariya): False
+    help=('If True, automatically insert `pvary` to match VMAs on simple ops.'),
+    include_in_jit_key=True,
+    include_in_trace_context=True)
+
 default_matmul_precision = optional_enum_state(
     name='jax_default_matmul_precision',
     enum_values=[
@@ -1760,6 +1804,15 @@ traceback_filtering = enum_state(
          "- ``quiet_remove_frames``: removes hidden frames from tracebacks, and adds "
          "a brief message (to the ``__cause__`` of the exception) describing that this has "
          "happened.\n\n")
+
+# TODO(rdyro): Remove once we always enable emit_pipeline primitive.
+use_emit_pipeline_primitive = bool_state(
+    name = 'jax_use_emit_pipeline_primitive',
+    default=False,
+    help="Controls whether to use the emit_pipeline primitive.",
+    include_in_jit_key=True,
+    include_in_trace_context=True)
+
 
 # This flag is for internal use.
 # TODO(tianjianlu): Removes once we always enable cusparse lowering.
@@ -2190,7 +2243,7 @@ jax_dump_ir_modes = string_flag(
     name="jax_dump_ir_modes",
     default=os.getenv("JAX_DUMP_IR_MODES", "stablehlo"),
     help="Comma-delimited modes in which to dump IR. Can be 'stablehlo' (the "
-         "default), 'jaxpr', or 'eqn_count_pprof' for "
+         "default), 'jaxpr', 'jaxpr_html', or 'eqn_count_pprof' for "
          "jaxpr equation count pprof profile.")
 
 jax_ragged_dot_use_ragged_dot_instruction = bool_state(
@@ -2216,7 +2269,44 @@ jax_ragged_dot_use_gpu_pallas_triton_lowering = bool_state(
 )
 
 jax_pallas_verbose_errors = bool_flag(
-    "jax_pallas_verbose_errors",
-    default=bool_env("JAX_PALLAS_VERBOSE_ERRORS", False),
-    help="If True, print verbose error messages for Pallas kernels.",
+    'jax_pallas_verbose_errors',
+    default=bool_env('JAX_PALLAS_VERBOSE_ERRORS', False),
+    help='If True, print verbose error messages for Pallas kernels.',
+)
+
+jax_pallas_enable_debug_checks = bool_state(
+    name='jax_pallas_enable_debug_checks',
+    default=False,
+    help=(
+        'If set, ``pl.debug_check`` calls are checked at runtime. Otherwise,'
+        ' they are a noop.'
+    ),
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
+
+jax_pallas_use_mosaic_gpu = bool_state(
+    name='jax_pallas_use_mosaic_gpu',
+    default=bool_env('JAX_PALLAS_USE_MOSAIC_GPU', True),
+    help=(
+        'If True, lower Pallas kernels to the experimental Mosaic GPU'
+        ' dialect, instead of Triton IR.'
+    ),
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
+
+jax_mosaic_allow_hlo = bool_state(
+    name='jax_mosaic_allow_hlo',
+    default=False,
+    help='Allow hlo dialects in Mosaic',
+)
+
+jax_pallas_poison_buffers = bool_state(
+    name="jax_pallas_poison_buffers",
+    default=False,
+    help=(
+        "If set, scratch buffers allocated by Pallas (e.g., in run_scoped)"
+        " are initialized with poison values (NaN for floats) at allocation time."
+    ),
 )

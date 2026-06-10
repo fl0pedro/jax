@@ -573,7 +573,8 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
           ("matrix-tensor", (5, 2), (3, 2, 4)),
           ("tensor-matrix", (5, 2, 3), (3, 2)),
           ("tensor-tensor", (5, 3, 4), (5, 4, 1)),
-          ("tensor-tensor-broadcast", (3, 1, 3, 4), (5, 4, 1))]],
+          ("tensor-tensor-broadcast", (3, 1, 3, 4), (5, 4, 1)),
+          ("tensor-tensor-both-1", (1, 5, 4), (1, 4, 3))]],
     lhs_dtype=number_dtypes,
     rhs_dtype=number_dtypes,
   )
@@ -590,6 +591,15 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match([lhs_dtype, rhs_dtype]):
       self._CheckAgainstNumpy(np_fun, jnp.matmul, args_maker, tol=tol)
       self._CompileAndCheck(jnp.matmul, args_maker, atol=tol, rtol=tol)
+
+  def testMatmulBothSize1BatchDimsSqueezedJaxpr(self):
+    x = jax.ShapeDtypeStruct((1, 5, 4), jnp.float32)
+    y = jax.ShapeDtypeStruct((1, 4, 3), jnp.float32)
+    jaxpr = jax.make_jaxpr(jnp.matmul)(x, y)
+    [dot_eqn] = (eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive == lax.dot_general_p)
+    self.assertEqual(dot_eqn.invars[0].aval.shape, (5, 4))
+    self.assertEqual(dot_eqn.invars[1].aval.shape, (4, 3))
+    self.assertEqual(dot_eqn.params['dimension_numbers'], (((1,), (0,)), ((), ())))
 
   @jtu.sample_product(
       lhs_batch=broadcast_compatible_shapes,
@@ -4588,7 +4598,8 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     )
     np_op = lambda x, i: np.take_along_axis(x, i, axis=axis)
     self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
-    self._CheckAgainstNumpy(np_op, jnp_one_hot_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_one_hot_op, args_maker,
+                            atol=1e-2, rtol=1e-2)
     self._CompileAndCheck(jnp_op, args_maker)
     self._CompileAndCheck(jnp_one_hot_op, args_maker)
 
@@ -5063,6 +5074,13 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
 
     jnp_op = getattr(jnp, op)
     dtype = np.dtype(dtypes.canonicalize_dtype(dtype)).type
+
+    machine = platform.machine()
+    is_arm = machine.startswith(('aarch', 'arm'))
+    # TODO(bchetioui): re-enable when b/518927213 is fixed
+    if is_arm and op == 'tanh' and dtype == np.float16:
+      self.skipTest('b/518927213: miscompile on ARM')
+
     for x in (np.nan, -np.inf, -100., -2., -1., 0., 1., 2., 100., np.inf,
               jnp.finfo(dtype).max, np.sqrt(jnp.finfo(dtype).max),
               np.sqrt(jnp.finfo(dtype).max) * 2.):
@@ -5096,6 +5114,31 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     np_fun = partial(np.corrcoef, rowvar=rowvar)
     np_fun = jtu.ignore_warning(
       category=RuntimeWarning, message="invalid value encountered.*")(np_fun)
+    jnp_fun = partial(jnp.corrcoef, rowvar=rowvar)
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, check_dtypes=False)
+    self._CompileAndCheck(jnp_fun, args_maker)
+
+  @unittest.skipIf(numpy_version < (2, 2, 0), "test covers NumPy 2.2+ behavior.")
+  @jtu.sample_product(
+      shape=[(1, 3), (3, 1)],
+      rowvar=[True, False],
+  )
+  @jax.default_matmul_precision("float32")
+  def testCorrCoefTransposeBehavior(self, shape, rowvar):
+    # Regression test for https://github.com/jax-ml/jax/issues/29571. The
+    # NumPy 2.2 update to jnp.cov (see
+    # https://github.com/numpy/numpy/pull/27661) flows through to corrcoef
+    # for single-row design matrices with rowvar=False, so the output shape
+    # and NaN propagation should now match NumPy.
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, np.float32)]
+
+    @jtu.ignore_warning(category=RuntimeWarning, message="invalid value.*")
+    @jtu.ignore_warning(category=RuntimeWarning, message="Degrees of freedom.*")
+    @jtu.ignore_warning(category=RuntimeWarning, message="divide by zero.*")
+    def np_fun(x):
+      return np.corrcoef(x, rowvar=rowvar)
+
     jnp_fun = partial(jnp.corrcoef, rowvar=rowvar)
     self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, check_dtypes=False)
     self._CompileAndCheck(jnp_fun, args_maker)
@@ -5734,7 +5777,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
         lambda: jax.jit(jnp.zeros)(2))
 
   def testTraceMethod(self):
-    x = self.rng().randn(3, 4).astype(jnp.float_)
+    x = self.rng().randn(3, 4).astype(float)
     self.assertAllClose(x.trace(), jnp.array(x).trace())
     self.assertAllClose(x.trace(), jax.jit(lambda y: y.trace())(x))
 

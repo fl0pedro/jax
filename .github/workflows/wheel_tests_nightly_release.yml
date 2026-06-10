@@ -48,6 +48,7 @@ env:
 
 jobs:
   run-pytest-cpu:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/pytest_cpu.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -75,6 +76,7 @@ jobs:
       max-processes: ${{ contains(matrix.runner, 'windows-x86') && '16' || '' }}
 
   run-bazel-test-cpu:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/bazel_cpu.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -96,6 +98,7 @@ jobs:
       clone_main_xla: 0
 
   run-pytest-cuda:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/pytest_cuda.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -147,6 +150,7 @@ jobs:
       halt-for-connection: ${{inputs.halt-for-connection}}
 
   run-bazel-test-cuda:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/bazel_cuda.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -173,7 +177,44 @@ jobs:
       build_artifacts_with_rbe: ${{ 'false' }}
       clone_main_xla: 0
 
+  build-rocm-artifacts:
+    if: github.repository_owner == 'jax-ml' || github.repository_owner == 'ROCm'
+    uses: ./.github/workflows/build_rocm_artifacts.yml
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    strategy:
+        fail-fast: false
+        matrix:
+          runner: ["linux-x86-64-1gpu-amd"]
+          artifact: ["jax-rocm-plugin", "jax-rocm-pjrt"]
+          python: ["3.11", "3.12", "3.13", "3.14"]
+          rocm: [
+            {label: "ROCm 7.2.0", wheel-version: "7", release-version: "7.2.0", manylinux-image: ""},
+          ]
+          exclude:
+            - artifact: "jax-rocm-pjrt"
+              python: "3.12"
+            - artifact: "jax-rocm-pjrt"
+              python: "3.13"
+            - artifact: "jax-rocm-pjrt"
+              python: "3.14"
+    name: "Build ROCm artifacts (${{ matrix.rocm.label }})"
+    with:
+      runner: ${{ matrix.runner }}
+      artifact: ${{ matrix.artifact }}
+      python: ${{ matrix.python }}
+      rocm-version: ${{ matrix.rocm.wheel-version }}
+      rocm-release-version: ${{ matrix.rocm.release-version }}
+      manylinux-image: ${{ matrix.rocm.manylinux-image }}
+      clone_main_xla: 0
+      upload_artifacts_to_s3: true
+      s3_upload_uri: 's3://jax-ci-amd/rocm-wheels/${{ github.repository }}/${{ github.ref_name }}/${{ matrix.rocm.release-version }}/wheel-tests-nightly/${{ github.run_number }}/${{ github.run_attempt }}'
+
   run-pytest-rocm:
+    if: ${{ !cancelled() && (github.repository_owner == 'jax-ml' || github.repository_owner == 'ROCm') }}
+    needs: [build-rocm-artifacts]
     permissions:
       id-token: write
       contents: read
@@ -185,19 +226,23 @@ jobs:
           runner: ["linux-x86-64-1gpu-amd", "linux-x86-64-4gpu-amd", "linux-x86-64-8gpu-amd"]
           python: ["3.11", "3.12", "3.13", "3.14"]
           rocm: [
-            {version: "7.2.0", tag: "rocm720"},
+            {label: "ROCm 7.2.0", wheel-version: "7", release-version: "7.2.0", tag: "rocm720"},
           ]
-    name: "Pytest ROCm (JAX artifacts version = ${{ startsWith(github.ref_name, 'release/') && 'latest release' || 'nightly' }})"
+    name: "Pytest ROCm (${{ matrix.rocm.label }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
-      rocm-version: ${{ matrix.rocm.version }}
+      rocm-version: ${{ matrix.rocm.wheel-version }}
+      rocm-release-version: ${{ matrix.rocm.release-version }}
       rocm-tag: ${{ matrix.rocm.tag }}
       jaxlib-version: "head"
       skip-download-jaxlib-and-plugins-from-gcs: ${{inputs.skip-download-jaxlib-and-plugins-from-gcs}}
       gcs_download_uri: ${{inputs.gcs_download_uri}}
+      s3_download_uri: 's3://jax-ci-amd/rocm-wheels/${{ github.repository }}/${{ github.ref_name }}/${{ matrix.rocm.release-version }}/wheel-tests-nightly/${{ github.run_number }}/${{ github.run_attempt }}'
 
   run-bazel-test-rocm:
+    if: ${{ !cancelled() && (github.repository_owner == 'jax-ml' || github.repository_owner == 'ROCm') }}
+    needs: [build-rocm-artifacts]
     permissions:
       id-token: write
       contents: read
@@ -205,20 +250,23 @@ jobs:
     strategy:
         fail-fast: false # don't cancel all jobs on failure
         matrix:
-          # Runner OS and Python values need to match the matrix stategy of our internal CI jobs
-          # that build the wheels.
           runner: ["linux-x86-64-1gpu-amd"]
           python: ["3.11", "3.12", "3.13", "3.14"]
-          rocm-version: [7]
+          rocm: [
+            {label: "ROCm 7.2.0", wheel-version: "7", release-version: "7.2.0", tag: "rocm720"},
+          ]
           enable-x64: [0]
-    name: "Bazel ROCm Non-RBE with ${{ format('{0}', 'build_jaxlib=false') }}"
+    name: "Bazel ROCm (${{ matrix.rocm.label }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
-      rocm-version: ${{ matrix.rocm-version }}
+      rocm-version: ${{ matrix.rocm.wheel-version }}
+      rocm-release-version: ${{ matrix.rocm.release-version }}
+      rocm-tag: ${{ matrix.rocm.tag }}
       enable-x64:  ${{ matrix.enable-x64 }}
       gcs_download_uri: ${{inputs.gcs_download_uri}}
       halt-for-connection: ${{inputs.halt-for-connection}}
+      s3_download_uri: 's3://jax-ci-amd/rocm-wheels/${{ github.repository }}/${{ github.ref_name }}/${{ matrix.rocm.release-version }}/wheel-tests-nightly/${{ github.run_number }}/${{ github.run_attempt }}'
       build_jaxlib: ${{ 'false' }}
       build_jax: ${{ 'false' }}
       jaxlib-version: "head"
@@ -227,6 +275,7 @@ jobs:
       clone_main_xla: 0
 
   run-pytest-tpu:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/pytest_tpu.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -238,7 +287,7 @@ jobs:
             {type: "v6e-8", cores: "8", runner: "linux-x86-ct6e-180-8tpu"},
             {type: "v7x-8", cores: "4", runner: "linux-x86-tpu7x-224-4tpu"}
           ]
-          libtpu-version-type: ["pinned", "nightly"]
+          libtpu-version-type: ["pinned"]
           exclude:
             # Exclude nightly for releases
             - libtpu-version-type: ${{ startsWith(github.ref_name, 'release/') && 'nightly' }}
@@ -291,6 +340,7 @@ jobs:
       halt-for-connection: ${{inputs.halt-for-connection}}
 
   run-bazel-test-tpu:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/bazel_test_tpu.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -302,7 +352,7 @@ jobs:
             {type: "v5e-8", cores: "8", runner: "linux-x86-ct5lp-224-8tpu"},
             {type: "v7x-8", cores: "4", runner: "linux-x86-tpu7x-224-4tpu"},
           ]
-          libtpu-version-type: ["pinned", "nightly"]
+          libtpu-version-type: ["pinned"]
           exclude:
             # Exclude nightly for releases
             - libtpu-version-type: ${{ startsWith(github.ref_name, 'release/') && 'nightly' }}
@@ -365,7 +415,7 @@ jobs:
       clone_main_xla: 0
 
   verify-release-wheels-install:
-    if: ${{ startsWith(github.ref_name, 'release/')}}
+    if: ${{ startsWith(github.ref_name, 'release/') && github.repository_owner == 'jax-ml' }}
     defaults:
       run:
         # Set the shell to bash as GitHub actions runs with /bin/sh by default
@@ -420,6 +470,7 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
         env:
+          CLOUDSDK_AUTH_DISABLE_CREDENTIALS: 1
           INPUTS_GCS_DOWNLOAD_URI: ${{ inputs.gcs_download_uri }}
           INPUTS_SKIP_DOWNLOAD_JAXLIB_AND_PLUGINS_FROM_GCS: ${{ inputs.skip-download-jaxlib-and-plugins-from-gcs }}
       - name: Verify JAX CPU packages can be installed

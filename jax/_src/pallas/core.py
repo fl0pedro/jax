@@ -28,6 +28,7 @@ import threading
 from typing import Any, ClassVar, Protocol, TypeAlias, Union, runtime_checkable
 
 from jax._src import api_util
+from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
 from jax._src import dtypes
@@ -50,12 +51,12 @@ from jax._src.state import types as state_types
 from jax._src.state.types import TransformedRef
 
 try:
-  import jax._src.pallas.mosaic.interpret.params as mosaic_tpu_interpret
+  import jax._src.pallas.mosaic.interpret.params as mosaic_tpu_interpret  # pyrefly: ignore[missing-import]
 except ImportError:
   mosaic_tpu_interpret = None
 
 try:
-  import jax._src.pallas.mosaic_gpu.interpret.params as mosaic_gpu_interpret
+  import jax._src.pallas.mosaic_gpu.interpret.params as mosaic_gpu_interpret  # pyrefly: ignore[missing-import]
 except ImportError:
   mosaic_gpu_interpret = None
 
@@ -145,6 +146,30 @@ class CompilerParams(Protocol):
   __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[Any]]]
 
 
+enable_debug_checks = config.jax_pallas_enable_debug_checks
+
+
+def debug_checks_enabled() -> bool:
+  """Returns runtime checks are enabled."""
+  return config.jax_pallas_enable_debug_checks.value
+
+
+enable_poison_buffers = config.jax_pallas_poison_buffers
+
+
+def poison_buffers_enabled() -> bool:
+  """Returns whether Pallas buffer poisoning is enabled."""
+  return config.jax_pallas_poison_buffers.value
+
+
+def debug_check(condition, message):
+  """Check the condition if
+  :func:`~jax.experimental.pallas.enable_debug_checks` is set, otherwise
+  do nothing.
+  """
+  return checkify.debug_check(condition, message)
+
+
 _backend_lowering_rules = {}
 
 
@@ -207,8 +232,18 @@ class Buffered:
   revisit: RevisitMode | None = None
 
 
+@runtime_checkable
+class MemoryRefBase(Protocol):
+
+  def get_array_aval(self) -> jax_core.ShapedArray:
+    ...
+
+  def get_ref_aval(self) -> TransformedRef | state.AbstractRef:
+    ...
+
+
 @dataclasses.dataclass(frozen=True)
-class MemoryRef:
+class MemoryRef(MemoryRefBase):
   """Like jax.ShapeDtypeStruct but with memory spaces."""
   inner_aval: jax_core.AbstractValue
   # TODO(b/368122763): Unify memory space types across backends
@@ -224,8 +259,6 @@ class MemoryRef:
     return self.inner_aval.update(dtype=dtype, memory_space=self.memory_space)
 
   def get_ref_aval(self) -> TransformedRef | state.AbstractRef:
-    # TODO(sharadmv): Clean this up. ShapedArrayWithMemorySpace fails when we
-    # try to apply JAX ops to it.
     return state.AbstractRef(self.inner_aval, self.memory_space)
 
   @property
@@ -343,7 +376,7 @@ def grid_env(env: GridEnv) -> Generator[None, None, None]:
   try:
     yield
   finally:
-   _pallas_tracing_env.grid_env_stack.pop()
+    _pallas_tracing_env.grid_env_stack.pop()
 
 
 def current_grid_env() -> GridEnv | None:
@@ -500,6 +533,12 @@ class _IndexMapFunc:
       out_indices = (out_indices,)
     return out_indices
 
+  def __repr__(self):
+    return f"_IndexMapFunc({self.index_map!r})"
+
+  def __str__(self):
+    return f"_IndexMapFunc({self.index_map!s})"
+
 
 @dataclasses.dataclass
 class BlockSpec:
@@ -541,6 +580,7 @@ class BlockSpec:
       grid: GridMappingGrid,
       vmapped_dims: tuple[int, ...],
       debug: bool = False,
+      allow_captured_consts: bool = False,
   ) -> BlockMapping:
     if self.block_shape is not None:
       if not hasattr(array_aval, "shape"):
@@ -648,7 +688,7 @@ class BlockSpec:
             f"{ov}."
         )
 
-    if consts:
+    if consts and not allow_captured_consts:
       raise ValueError(
           f"Index map function {debug_info.func_src_info} for "
           f"{origin} must not capture constants: {consts}"
@@ -662,6 +702,7 @@ class BlockSpec:
         array_aval=array_aval,
         origin=origin,
         pipeline_mode=self.pipeline_mode,
+        allow_captured_consts=allow_captured_consts,
         debug=debug,
     )
     mapping.check_invariants()
@@ -715,6 +756,12 @@ class BlockMapping:
   transforms: Sequence[state_types.Transform] = ()
   pipeline_mode: Buffered | None = None
   debug: bool = False
+  allow_captured_consts: dataclasses.InitVar[bool] = False
+
+  def __post_init__(self, allow_captured_consts: bool):
+    if not allow_captured_consts and self.index_map_jaxpr.consts:
+      raise ValueError(f"BlockMapping for {self.origin} has captured constants:"
+                       f" {self.index_map_jaxpr.consts}")
 
   def check_invariants(self) -> None:
     if not config.enable_checks.value: return
@@ -725,15 +772,15 @@ class BlockMapping:
     assert len(self.block_shape) == len(self.array_aval.shape), (
         self.block_shape, self.array_aval
     )
-
-    assert not self.index_map_jaxpr.consts
     assert all(ov.shape == () and
                (ov.dtype == jnp.int32 or ov.dtype == jnp.int64)
                for ov in self.index_map_jaxpr.out_avals), (
                self.index_map_jaxpr.out_avals)
 
   def replace(self, **kwargs):
-    new_self = dataclasses.replace(self, **kwargs)
+    allow_captured_consts = len(self.index_map_jaxpr.consts) > 0
+    new_self = dataclasses.replace(
+        self, **kwargs, allow_captured_consts=allow_captured_consts)
     new_self.check_invariants()
     return new_self
 
@@ -759,10 +806,7 @@ class BlockMapping:
     return TransformedRef(self.transformed_block_aval, reverse_transforms)
 
   def compute_start_indices_interpret(self, loop_idx, *args):
-    discharged_jaxpr, discharged_consts = state_discharge.discharge_state(
-        self.index_map_jaxpr.jaxpr, self.index_map_jaxpr.consts
-    )
-    jaxpr = jax_core.ClosedJaxpr(discharged_jaxpr, discharged_consts)
+    jaxpr = state_discharge.discharge_state(self.index_map_jaxpr)
     block_indices_and_rest = jax_core.jaxpr_as_fun(jaxpr)(*loop_idx, *args)
     # Since we're passing in `Ref`s potentially, we need to split out their
     # updated values since we only care about the return values.
@@ -793,7 +837,8 @@ class BlockMapping:
   def to_block_spec(self) -> BlockSpec:
     def index_map(*args):
       flat_args = tree_util.tree_leaves(args)
-      return jax_core.jaxpr_as_fun(self.index_map_jaxpr)(*flat_args)
+      flat_out = jax_core.jaxpr_as_fun(self.index_map_jaxpr)(*flat_args)
+      return tree_util.tree_unflatten(self.index_map_out_tree, flat_out)
     return BlockSpec(
         self.block_shape,
         index_map,
@@ -825,6 +870,7 @@ class BlockMapping:
             index_map_tree=index_map_tree,
             grid=grid,
             vmapped_dims=vmapped_dims,
+            allow_captured_consts=True,  # catch earlier if necessary
             debug=self.debug,
         )
         for bs, lo_array_aval in zip(lo_block_specs, lo_array_avals)
@@ -1020,8 +1066,7 @@ class GridMapping:
   def in_shapes(self) -> Iterable[jax_core.ShapeDtypeStruct]:
     """The shapes of ``*index``, ``*inputs``."""
     index_shapes = (
-        # pyrefly: ignore[missing-attribute]
-        jax_core.ShapeDtypeStruct(ia.shape, ia.dtype)
+        jax_core.ShapeDtypeStruct.like(ia)
         for ia in self.index_map_avals[len(self.grid) :]
     )
     inputs_shapes = (
@@ -1120,6 +1165,7 @@ def _convert_block_spec_to_block_mapping(
     index_map_tree: tree_util.PyTreeDef,
     grid: GridMappingGrid,
     vmapped_dims: tuple[int, ...],
+    allow_captured_consts: bool,
     debug: bool = False,
 ) -> BlockMapping:
   if block_spec is no_block_spec:
@@ -1131,6 +1177,7 @@ def _convert_block_spec_to_block_mapping(
       index_map_tree=index_map_tree,
       grid=grid,
       vmapped_dims=vmapped_dims,
+      allow_captured_consts=allow_captured_consts,
       debug=debug,
   )
 
@@ -1211,6 +1258,7 @@ def get_grid_mapping(
     out_avals: Sequence[jax_core.AbstractValue],
     out_tree: tree_util.PyTreeDef,
     out_origins: Sequence[OriginStr],
+    allow_captured_consts: bool = False,
     debug: bool = False,
 ) -> tuple[tuple[jax_core.AbstractValue, ...], GridMapping]:
   if dynamic_shapes_export_enabled():
@@ -1218,7 +1266,7 @@ def get_grid_mapping(
   else:
     dim_check: Any = jax_core.is_constant_dim
   assert all(i is None or dim_check(i) for i in grid_spec.grid)
-  grid_mapping_grid: GridMappingGrid = tuple(
+  grid_mapping_grid: GridMappingGrid = tuple(  # pyrefly: ignore[bad-assignment]
       dynamic_grid_dim if (  # pyrefly: ignore[bad-argument-type]
           d is None or (not jax_core.is_constant_dim(d) and not dynamic_shapes_export_enabled())
       ) else d
@@ -1290,6 +1338,7 @@ def get_grid_mapping(
           index_map_tree=index_map_tree,
           grid=grid_mapping_grid,
           vmapped_dims=(),
+          allow_captured_consts=allow_captured_consts,
           debug=debug,
       ),
       flat_in_specs,
@@ -1315,6 +1364,7 @@ def get_grid_mapping(
           index_map_tree=index_map_tree,
           grid=grid_mapping_grid,
           vmapped_dims=(),
+          allow_captured_consts=allow_captured_consts,
           debug=debug,
       ),
       flat_out_specs,
@@ -1481,6 +1531,9 @@ def core_map(
       and dict format. The space will be core-local unless the memory space type
       is specified to be shared (e.g., VMEM_SHARED).
   """
+  interpret = (
+      config.pallas_tpu_interpret_mode_context_manager.value or interpret)
+
   def wrapped(f):
     if isinstance(scratch_shapes, dict):
       fun_args = ((), scratch_shapes)
@@ -1541,6 +1594,8 @@ effects.remat_allowed_effects.add_type(CommsEffect)
 effects.custom_derivatives_allowed_effects.add_type(CommsEffect)
 
 kernel_local_effects: effects.EffectTypeSet = effects.EffectTypeSet()
+kernel_local_effects.add_type(jax_core.InternalMutableArrayEffect)
+kernel_local_effects.add_type(CommsEffect)
 
 
 def get_interpret_effects(interpret: Any) -> Set[effects.Effect]:
@@ -1623,6 +1678,11 @@ class Mesh(Protocol):
   @property
   def supported_memory_spaces(self) -> Sequence[Any]:
     """Return the memory spaces supported by the mesh."""
+
+  @contextlib.contextmanager
+  def tracing_context(self) -> Generator[None, None, None]:
+    raise NotImplementedError()
+    yield
 
 
 _core_map_mesh_rules: dict[type[Any], Callable[..., Any]] = {}
@@ -1721,7 +1781,7 @@ def default_mesh_discharge_rule(
   )(*args)
 
   # ``outs`` lacks the unmodified inputs. Add them back in.
-  all_outs = [None] * len(args)
+  all_outs = [None] * len(args)  # pyrefly: ignore[unsupported-assignment]
   for out_idx, in_idx in enumerate(modified_idxs):
     all_outs[in_idx] = outs[out_idx]
   return all_outs, ()

@@ -46,10 +46,10 @@ from jax._src import source_info_util
 from jax._src import util
 from jax._src import xla_bridge as xb
 from jax._src.interpreters import partial_eval as pe
-from jax._src.layout import AutoLayout, Layout
+from jax._src.layout import AutoLayoutSingleton, Layout
 from jax._src.lib import _jax
 from jax._src.lib import jax_mlir_ext
-from jax._src.lib import jaxlib_extension_version
+from jax._src.lib import pytree
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import dialects, ir, passmanager
 from jax._src.lib.mlir.dialects import func as func_dialect, hlo
@@ -85,9 +85,9 @@ dense_int_array = ir.DenseI64ArrayAttr.get
 def i32_attr(i): return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), i)
 def i64_attr(i): return ir.IntegerAttr.get(ir.IntegerType.get_signless(64), i)
 
-def shape_tensor(sizes: Sequence[int | ir.Value]) -> ir.Value:
-  int1d = aval_to_ir_type(core.ShapedArray((1,), np.int32))
-  i32_type = aval_to_ir_type(core.ShapedArray((), np.int32))
+def shape_tensor(ctx: ModuleContext, sizes: Sequence[int | ir.Value]) -> ir.Value:
+  int1d = aval_to_ir_type(ctx, core.ShapedArray((1,), np.int32))
+  i32_type = aval_to_ir_type(ctx, core.ShapedArray((), np.int32))
   def lower_dim(d):
     if type(d) is int:
       return ir_constant(np.array([d], np.int32))
@@ -156,6 +156,8 @@ _dtype_to_ir_type : dict[np.dtype, Callable[[], ir.Type]] = {
   np.dtype(dtypes.float8_e4m3): ir.Float8E4M3Type.get,
   np.dtype(dtypes.float8_e8m0fnu): ir.Float8E8M0FNUType.get,
   np.dtype(dtypes.float4_e2m1fn): ir.Float4E2M1FNType.get,
+  np.dtype(dtypes.float6_e2m3fn): ir.Float6E2M3FNType.get,
+  np.dtype(dtypes.float6_e3m2fn): ir.Float6E3M2FNType.get,
 }
 
 if dtypes.int1 is not None:
@@ -195,38 +197,41 @@ def _dynamic_array_ir_types(aval: core.ShapedArray) -> ir.Type:
 
 ir_type_handlers: dict[type[core.AbstractValue], Callable[[Any], IrTypes]] = {}
 
-def aval_to_ir_type(aval: core.AbstractValue) -> ir.Type:
+def aval_to_ir_type(ctx: ModuleContext, aval: core.AbstractValue) -> ir.Type:
   """Converts a JAX aval to a single MLIR IR type.
 
   Use only when ``aval`` is known to map to a single IR type. For opaque
   avals, use ``aval_to_ir_types`` instead.
   """
-  ir_type = _aval_to_ir_types(aval)
+  ir_type = _aval_to_ir_types(ctx, aval)
   if isinstance(ir_type, ir.Type):
     return ir_type
   raise TypeError(f"Expected a single IR type, got {ir_type}")
 
 ir_type_handlers[core.ShapedArray] = _array_ir_types
 ir_type_handlers[core.AbstractToken] = lambda _: hlo.TokenType.get()
-if jaxlib_extension_version >= 427:
-  ir_type_handlers[core.AbstractTodo] = lambda x: hlo.FutureType.get([_array_ir_types(x.inner_aval)])
+ir_type_handlers[core.AbstractFuture] = lambda x: hlo.FutureType.get([_array_ir_types(x.inner_aval)])
 
-def aval_to_ir_types(aval: core.AbstractValue) -> tuple[ir.Type, ...]:
+def aval_to_ir_types(ctx: ModuleContext, aval: core.AbstractValue) -> tuple[ir.Type, ...]:
   """Converts a JAX aval to one or more MLIR IR types.
 
   In general, a JAX value may be represented by multiple IR values, so this
   function returns a tuple of types. This is the safe version to use when the
   concrete type of ``aval`` is not known.
   """
-  ir_types = _aval_to_ir_types(aval)
+  ir_types = _aval_to_ir_types(ctx, aval)
   return (ir_types,) if isinstance(ir_types, ir.Type) else ir_types
 
 
-def _aval_to_ir_types(aval: core.AbstractValue) -> IrTypes:
+def _aval_to_ir_types(ctx: ModuleContext, aval: core.AbstractValue) -> IrTypes:
+  if (cached := ctx.aval_to_ir_types_cache.get(aval)) is not None:
+    return cached
   try:
-    return ir_type_handlers[type(aval)](aval)
+    res = ir_type_handlers[type(aval)](aval)
   except KeyError as err:
     raise TypeError(f"No ir_type_handler for aval type: {type(aval)}") from err
+  ctx.aval_to_ir_types_cache[aval] = res
+  return res
 
 
 # Constants
@@ -422,15 +427,7 @@ def _numpy_array_attribute(x: np.ndarray | np.generic) -> ir.Attribute:
   element_type = dtype_to_ir_type(x.dtype)
   shape = x.shape
   x = np.ascontiguousarray(x)
-  try:
-    return ir.DenseElementsAttr.get(x, type=element_type, shape=shape)
-  except ValueError:
-    # Backwards compatibility fallback for old MLIR versions.
-    # Delete once minimum supported jaxlib version is 0.9.1.
-    if x.dtype != np.bool_:
-      raise
-    x = np.ascontiguousarray(np.packbits(x, bitorder='little'))
-    return ir.DenseElementsAttr.get(x, type=element_type, shape=shape)
+  return ir.DenseElementsAttr.get(x, type=element_type, shape=shape)
 
 def _numpy_array_attribute_handler(val: np.ndarray | np.generic) -> ir.Attribute:
   if 0 in val.strides and val.size > 0:
@@ -645,11 +642,8 @@ def make_ir_context() -> ir.Context:
   return context
 
 
-AxisContext = Union[
-    sharding_impls.SPMDAxisContext,
-    sharding_impls.ReplicaAxisContext,
-    sharding_impls.ShardingContext,
-]
+AxisContext = Union[sharding_impls.SPMDAxisContext,
+                    sharding_impls.ShardingContext]
 
 class ShapePolyLoweringState:
   # The names of the dimension variables, sorted by name. This is the order in
@@ -682,7 +676,7 @@ class ShapePolyLoweringState:
     self.uses_dim_vars = (len(dim_vars) > 0)
     self.dim_vars = dim_vars
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class LoweringParameters:
   # A mapping between primitives and user-defined LoweringRules.
   # When lowering a primitive, give priority to the rule in this map over
@@ -719,7 +713,7 @@ def _code_to_filename(code: types.CodeType) -> str | None:
   pattern = config.hlo_source_file_canonicalization_regex.value
   return re.sub(pattern, '', code.co_filename) if pattern else code.co_filename
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class TracebackCaches:
   traceback_to_location_cache: Any  # jax_mlir_ext.TracebackToLocationCache
   canonical_name_cache: dict[str, str]
@@ -732,8 +726,11 @@ class TracebackCaches:
     self.canonical_name_cache = {}
 
 
-@dataclasses.dataclass(frozen=True)
+@util.immutable
 class LoweringCacheKey:
+  __slots__ = ("primitive", "eqn_ctx", "avals_in", "effects", "params",
+               "platforms", "__weakref__")
+
   primitive: core.Primitive
   eqn_ctx: core.JaxprEqnContext
   avals_in: tuple[core.AbstractValue, ...]
@@ -741,15 +738,40 @@ class LoweringCacheKey:
   params: tuple[tuple[str, Any], ...]
   platforms: tuple[str, ...]
 
+  @staticmethod
+  @util.weak_value_interner
+  def _create(primitive, eqn_ctx, avals_in, effects, params, platforms):
+    obj = object.__new__(LoweringCacheKey)
+    object.__setattr__(obj, "primitive", primitive)
+    object.__setattr__(obj, "eqn_ctx", eqn_ctx)
+    object.__setattr__(obj, "avals_in", avals_in)
+    object.__setattr__(obj, "effects", effects)
+    object.__setattr__(obj, "params", params)
+    object.__setattr__(obj, "platforms", platforms)
+    return obj
+
+  def __new__(cls, primitive, eqn_ctx, avals_in, effects, params, platforms):
+    return cls._create(primitive, eqn_ctx, avals_in, effects, params, platforms)
+
+  def __repr__(self) -> str:
+    return (
+        f"LoweringCacheKey(primitive={self.primitive}, "
+        f"eqn_ctx={self.eqn_ctx}, avals_in={self.avals_in}, "
+        f"effects={self.effects}, params={self.params}, "
+        f"platforms={self.platforms})"
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class LoweringCacheValue:
   func: func_dialect.FuncOp
-  output_types: Sequence[IrTypes]
+  flat_output_types: list[ir.Type]
+  output_treedef: pytree.PyTreeDef
   const_args: Sequence[ArrayLike]  # The hoisted constants expected by `func`
   const_arg_avals: Sequence[core.AbstractValue]
   inline: bool  # Inline calls to this lowered function?
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class ModuleContext:
   """Module-wide context information for MLIR lowering."""
   context: ir.Context
@@ -771,17 +793,15 @@ class ModuleContext:
 
   # Cached primitive lowerings.
   lowering_cache: dict[LoweringCacheKey, LoweringCacheValue]
-  cached_primitive_lowerings: dict[Any, func_dialect.FuncOp]
+  cached_primitive_lowerings: dict[Any, Any]
   sharding_attr_cache: dict[SdyArray, sdy.TensorShardingAttr]
+  aval_to_ir_types_cache: dict[core.AbstractValue, IrTypes]
+  pallas_lowering_cache: dict[Any, Any]
 
   # Cached traceback information.
   traceback_caches: TracebackCaches
 
   lowering_parameters: LoweringParameters
-
-  @property
-  def axis_env(self) -> sharding_impls.AxisEnv:
-    return self.axis_context.axis_env
 
   def __init__(
       self,
@@ -798,11 +818,13 @@ class ModuleContext:
       ip: ir.InsertionPoint | None = None,
       symbol_table: ir.SymbolTable | None = None,
       lowering_cache: None | dict[LoweringCacheKey, Any] = None,
-      cached_primitive_lowerings: None | dict[Any, func_dialect.FuncOp] = None,
+      cached_primitive_lowerings: None | dict[Any, Any] = None,
       traceback_caches: None | TracebackCaches = None,
       shape_poly_state = None,
       all_default_mem_kind: bool = True,
-      sharding_attr_cache: None | dict[SdyArray, sdy.TensorShardingAttr] = None):
+      sharding_attr_cache: None | dict[SdyArray, sdy.TensorShardingAttr] = None,
+      aval_to_ir_types_cache: None | dict[core.AbstractValue, IrTypes] = None,
+      pallas_lowering_cache: None | dict[Any, Any] = None):
 
     self.context = context or make_ir_context()
     self.module = module or ir.Module.create(loc=ir.Location.unknown(self.context))
@@ -825,6 +847,8 @@ class ModuleContext:
     self.all_default_mem_kind = all_default_mem_kind
     self.lowering_parameters = lowering_parameters
     self.sharding_attr_cache = ({} if sharding_attr_cache is None else sharding_attr_cache)
+    self.aval_to_ir_types_cache = ({} if aval_to_ir_types_cache is None else aval_to_ir_types_cache)
+    self.pallas_lowering_cache = ({} if pallas_lowering_cache is None else pallas_lowering_cache)
 
   def get_backend(self, optional: bool = False) -> xc.Client | None:
     if len(self.platforms) > 1:
@@ -871,7 +895,7 @@ class ModuleContext:
   def replace(self, **kw): return dataclasses.replace(self, **kw)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class LoweringRuleContext:
   """Per-rule context information for MLIR lowering."""
   module_context: ModuleContext
@@ -927,7 +951,7 @@ class LoweringRuleContext:
 LoweringRule = Callable[..., Sequence[ir.Value | Sequence[ir.Value]]]
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class LoweringRuleEntry:
   rule: LoweringRule
   inline: bool
@@ -974,44 +998,60 @@ def register_lowering(prim: core.Primitive, rule: LoweringRule,
       _platform_specific_lowerings[p][prim] = LoweringRuleEntry(rule, inline)
 
 
+ir_tree_registry = pytree.PyTreeRegistry(
+    enable_none=False,
+    enable_tuple=True,
+    enable_namedtuple=False,
+    enable_list=True,
+    enable_dict=False,
+)
+
+def _op_result_list_to_iterable(results: ir.OpResultList):
+  return results, None
+
+def _op_result_list_from_iterable(unused_aux_data, results):
+  return list(results)
+
+ir_tree_registry.register_node(
+    ir.OpResultList, _op_result_list_to_iterable, _op_result_list_from_iterable)
+
+
 def flatten_ir_values(xs: Iterable[IrValues]) -> list[ir.Value]:
-  """Concatenates/flattens a list of ir.Values or ir.Value sequences."""
-  out = []
-  for x in xs:
-    if isinstance(x, ir.Value):
-      out.append(x)
-    else:
-      out.extend(x)
-  return out
+  warnings.warn(
+      "jax.interpreters.mlir.flatten_ir_values is deprecated. "
+      "Use mlir.ir_tree_registry.flatten instead.",
+      DeprecationWarning,
+      stacklevel=2,
+  )
+  flat, _ = ir_tree_registry.flatten(xs)
+  return flat
+
 
 def flatten_ir_types(xs: Iterable[IrTypes]) -> list[ir.Type]:
-  """Concatenates/flattens a list of ir.Types or ir.Type sequences."""
-  out = []
-  for x in xs:
-    if isinstance(x, ir.Type):
-      out.append(x)
-    else:
-      out.extend(x)
-  return out
+  warnings.warn(
+      "jax.interpreters.mlir.flatten_ir_types is deprecated. "
+      "Use mlir.ir_tree_registry.flatten instead.",
+      DeprecationWarning,
+      stacklevel=2,
+  )
+  flat, _ = ir_tree_registry.flatten(xs)
+  return flat
 
-_unflatten_done = object()
+def unflatten_ir_values_like_types(
+    xs: Iterable[ir.Value], ys: Sequence[IrTypes]
+) -> list[IrValues]:
+  warnings.warn(
+      "jax.interpreters.mlir.unflatten_ir_values_like_types is deprecated. "
+      "Use treedef.unflatten instead.",
+      DeprecationWarning,
+      stacklevel=2,
+  )
+  _, treedef = ir_tree_registry.flatten(ys)
+  return treedef.unflatten(xs)
+
 
 def len_ir_types(x: IrTypes) -> int:
   return 1 if isinstance(x, ir.Type) else len(x)
-
-def unflatten_ir_values_like_types(xs: Iterable[ir.Value],
-                                   ys: Sequence[IrTypes]) -> list[IrValues]:
-  """Splits `xs` into subsequences of lengths `ns`.
-
-  Unlike `split_list`, the `sum(ns)` must be equal to `len(xs)`, and if n == 1
-  then values are not wrapped in a singleton list."""
-  xs_iter = iter(xs)
-  unflattened: list[IrValues]
-  unflattened = [next(xs_iter) if isinstance(y, ir.Type) else
-                 tuple(next(xs_iter) for _ in range(len(y)))
-                 for y in ys]
-  assert next(xs_iter, _unflatten_done) is _unflatten_done
-  return unflattened
 
 
 _module_name_regex = re.compile(r"[^\w.-]")
@@ -1043,8 +1083,9 @@ def eval_dynamic_shape(ctx: LoweringRuleContext,
   res = lower_fun(
       partial(core.evaluate_shape, shape, ctx.module_context.shape_poly_state.dim_vars),
       multiple_results=True)(ctx, *ctx.dim_var_values)
+  flat_res, _ = ir_tree_registry.flatten(res)
   return tuple(operator.index(d) if core.is_constant_dim(d) else d_ir
-               for d, d_ir in zip(shape, flatten_ir_values(res)))
+               for d, d_ir in zip(shape, flat_res))
 
 # TODO: replace usage of eval_dynamic_shape_as_vals with eval_dynamic_shape_as_ivals
 def eval_dynamic_shape_as_vals(ctx: LoweringRuleContext,
@@ -1055,7 +1096,7 @@ def eval_dynamic_shape_as_vals(ctx: LoweringRuleContext,
       return ir_constant(np.array(d, dtype=np.int32))
     else:
       assert isinstance(d, ir.Value)
-      i32_type = aval_to_ir_type(core.ShapedArray((), np.int32))
+      i32_type = aval_to_ir_type(ctx.module_context, core.ShapedArray((), np.int32))
       if d.type != i32_type:
         return hlo.convert(i32_type, d)
       else:
@@ -1072,7 +1113,7 @@ def eval_dynamic_shape_as_ivals(
       return d
     else:
       assert isinstance(d, ir.Value)
-      i32_type = aval_to_ir_type(core.ShapedArray((), np.int32))
+      i32_type = aval_to_ir_type(ctx.module_context, core.ShapedArray((), np.int32))
       if d.type != i32_type:
         return hlo.convert(i32_type, d)
       else:
@@ -1082,7 +1123,8 @@ def eval_dynamic_shape_as_ivals(
 def eval_dynamic_shape_as_tensor(ctx: LoweringRuleContext,
                                  shape: core.Shape) -> ir.Value:
   """Evaluates the dynamic shapes as one 1d int32 tensor."""
-  [x] = flatten_ir_values([shape_tensor(eval_dynamic_shape(ctx, shape))])
+  [x], _ = ir_tree_registry.flatten(
+      shape_tensor(ctx.module_context, eval_dynamic_shape(ctx, shape)))
   return x
 
 class LoweringResult(NamedTuple):
@@ -1145,11 +1187,11 @@ def _to_physical_op_sharding(
   return sharding._to_xla_hlo_sharding(aval.ndim).to_proto()
 
 
-def _to_xla_layout(layout: Layout | None | AutoLayout,
+def _to_xla_layout(layout: Layout | None | AutoLayoutSingleton,
                    aval: core.AbstractValue) -> str | None:
   if layout is None:
     return None
-  if isinstance(layout, AutoLayout):
+  if isinstance(layout, AutoLayoutSingleton):
     return "auto"
   if aval is core.abstract_token:
     return None
@@ -1164,7 +1206,8 @@ def _get_mem_kind(s: JSharding | None) -> str | None:
 
 
 def contains_unconstrained(s):
-  return isinstance(s, NamedSharding) and PartitionSpec.UNCONSTRAINED in s.spec
+  return (isinstance(s, NamedSharding) and
+          PartitionSpec.UNCONSTRAINED in s.spec.partitions)
 
 def all_unconstrained(s, aval):
   if isinstance(s, NamedSharding):
@@ -1172,7 +1215,7 @@ def all_unconstrained(s, aval):
       return False
     if aval.ndim != len(s.spec):
       return False
-    return all(p is PartitionSpec.UNCONSTRAINED for p in s.spec)
+    return all(p is PartitionSpec.UNCONSTRAINED for p in s.spec.partitions)
   return False
 
 
@@ -1256,8 +1299,8 @@ def lower_jaxpr_to_module(
     replicated_args: Sequence[bool] | None = None,
     arg_shardings: Sequence[JSharding | None] | None = None,
     result_shardings: Sequence[JSharding | None] | None = None,
-    in_layouts: Sequence[Layout | None | AutoLayout] | None = None,
-    out_layouts: Sequence[Layout | None | AutoLayout] | None = None,
+    in_layouts: Sequence[Layout | None | AutoLayoutSingleton] | None = None,
+    out_layouts: Sequence[Layout | None | AutoLayoutSingleton] | None = None,
     arg_names: Sequence[str] | None = None,
     result_names: Sequence[str] | None = None,
     num_partitions: int = 1,
@@ -1393,11 +1436,6 @@ def lower_jaxpr_to_module(
                      dump_module_message(ctx.module, "verification")) from e
 
   with ctx.context:
-    # Cached lowering rule evaluation leaves dead functions. Remove them.
-    pipeline = passmanager.PassManager.parse(
-        'builtin.module(symbol-dce)')
-    pipeline.run(ctx.module.operation)
-
     if config.use_shardy_partitioner.value:
       pipeline = passmanager.PassManager.parse(
           'builtin.module(sdy-lift-inlined-meshes)')
@@ -1450,8 +1488,8 @@ def _set_up_aliases(input_output_aliases, avals_in, avals_out,
       input_id = donations[key].popleft()
       out_donated_args[input_id] = False
       if (in_out_layout_not_none and
-          isinstance(in_layouts[input_id], AutoLayout) and
-          not isinstance(out_layouts[i], AutoLayout)):
+          isinstance(in_layouts[input_id], AutoLayoutSingleton) and
+          not isinstance(out_layouts[i], AutoLayoutSingleton)):
         raise ValueError(
             f"Input layout being donated was {in_layouts[input_id]} while"
             f" output layout was {out_layouts[i]}. Did you mean to set the"
@@ -1459,8 +1497,8 @@ def _set_up_aliases(input_output_aliases, avals_in, avals_out,
             " allow for the input and output layout to be chosen by XLA and"
             " not the layout of the output which might not be optimal.")
       if (in_out_layout_not_none and
-          not isinstance(in_layouts[input_id], AutoLayout) and
-          isinstance(out_layouts[i], AutoLayout)):
+          not isinstance(in_layouts[input_id], AutoLayoutSingleton) and
+          isinstance(out_layouts[i], AutoLayoutSingleton)):
         raise ValueError(
             f"Input layout being donated was {in_layouts[input_id]} while"
             f" output layout was {out_layouts[i]}. Did you mean to set the"
@@ -1516,16 +1554,20 @@ token_type = hlo.TokenType.get
 create_token = hlo.create_token
 
 class TokenSet:
-  """An immutable container of tokens to be used to lower effectful jaxprs. When lowering
-  effectful jaxprs, we need to thread HLO tokens to sequence them. Each effect
-  will need its own token that will be threaded in and out of the effectful
-  primitives. A `TokenSet` encapsulates a set of HLO tokens that will be
-  used by the lowering rules.
+  """An immutable container of tokens to be used to lower effectful jaxprs. When
+  lowering effectful jaxprs, we need to thread HLO tokens to sequence them. Each
+  effect will need its own token that will be threaded in and out of the
+  effectful primitives. A `TokenSet` encapsulates a set of HLO tokens that will
+  be used by the lowering rules.
   """
-  _tokens: collections.OrderedDict[core.Effect, Token]
+  __slots__ = ("_tokens",)
 
-  def __init__(self, *args: Any, **kwargs: Any):
-    self._tokens = collections.OrderedDict(*args, **kwargs)
+  # Insertion order is important here, since it corresponds to the order of the
+  # IR values in the generated IR.
+  _tokens: dict[core.Effect, Any]
+
+  def __init__(self, tokens: dict[core.Effect, Any] | None = None):
+    self._tokens = tokens if tokens is not None else {}
 
   def __len__(self):
     return len(self._tokens)
@@ -1536,28 +1578,34 @@ class TokenSet:
   @classmethod
   def create(cls, effects: Sequence[core.Effect]) -> TokenSet:
     """Creates a `TokenSet` corresponding to a list of `core.Effect`s."""
-    tokens = [create_token() for _ in effects]
-    return TokenSet(zip(effects, tokens))
+    return TokenSet({eff: create_token() for eff in effects})
 
   def items(self) -> Sequence[tuple[core.Effect, Token]]:
     return tuple(self._tokens.items())
 
   def effects(self) -> set[core.Effect]:
+    # Caution: sets do not preserve order! Be very careful if you iterate over
+    # this set.
     return set(self._tokens.keys())
 
   def subset(self, effects: Sequence[core.Effect]) -> TokenSet:
     """Return a subset of the `TokenSet` restricted to a set of `core.Effect`s."""
-    return TokenSet((eff, self._tokens[eff]) for eff in effects)
+    return TokenSet({eff: self._tokens[eff] for eff in effects})
 
   def update_tokens(self, tokens: TokenSet) -> TokenSet:
-    """Returns a new `TokenSet` with tokens replaced with ones from the input `TokenSet`."""
-    new_tokens = []
-    for eff in self.effects():
-      if eff in tokens._tokens:
-        new_tokens.append((eff, tokens._tokens[eff]))
-      else:
-        new_tokens.append((eff, self._tokens[eff]))
-    return TokenSet(new_tokens)
+    """Returns a new `TokenSet` with tokens replaced with ones from the input `TokenSet`.
+
+    Preserves the order of the original `TokenSet`.
+
+    Args:
+      tokens: The input `TokenSet` with tokens to update, which should contain a
+        subset of the effects in `self`
+    """
+    if not tokens:
+      return self
+    return TokenSet({
+        eff: tokens._tokens.get(eff, self._tokens[eff]) for eff in self._tokens
+    })
 
 def lower_jaxpr_to_fun(
     ctx: ModuleContext,
@@ -1578,8 +1626,8 @@ def lower_jaxpr_to_fun(
     result_names: Sequence[str] | None = None,
     arg_memory_kinds: Sequence[str | None] | None = None,
     result_memory_kinds: Sequence[str | None] | None = None,
-    arg_layouts: Sequence[Layout | None | AutoLayout] | None = None,
-    result_layouts: Sequence[Layout | None | AutoLayout] | None = None,
+    arg_layouts: Sequence[Layout | None | AutoLayoutSingleton] | None = None,
+    result_layouts: Sequence[Layout | None | AutoLayoutSingleton] | None = None,
     propagated_out_mem_kinds: tuple[None | str, ...] | None = None,
 ) -> func_dialect.FuncOp:
   """Lowers jaxpr and its callees to an IR function.
@@ -1624,7 +1672,7 @@ def lower_jaxpr_to_fun(
   # The first dimension variable may be the platform index
   num_dim_vars = len(ctx.shape_poly_state.dim_vars)
   dim_var_avals = [core.ShapedArray((), dtypes.default_int_dtype())] * num_dim_vars
-  dim_var_types = map(aval_to_ir_type, dim_var_avals)
+  dim_var_types = [aval_to_ir_type(ctx, aval) for aval in dim_var_avals]
 
   nr_args = num_const_args + len(jaxpr.in_avals)
 
@@ -1640,8 +1688,8 @@ def lower_jaxpr_to_fun(
   assert arg_names is None or nr_args == len(arg_names), (nr_args, arg_names)
 
   # Function inputs: *dim_var_values, *tokens, *const_args, *actual_inputs
-  input_types = map(_aval_to_ir_types, in_avals)
-  output_types = map(_aval_to_ir_types, jaxpr.out_avals)
+  input_types = [_aval_to_ir_types(ctx, a) for a in in_avals]
+  output_types = [_aval_to_ir_types(ctx, a) for a in jaxpr.out_avals]
   num_tokens = len(effects)
 
   token_types = [token_type() for _ in effects]
@@ -1685,8 +1733,8 @@ def lower_jaxpr_to_fun(
     xla_donated_args = [*([False] * (num_dim_vars + num_tokens)),
                         *xla_donated_args]
 
-  flat_input_types = flatten_ir_types(input_types)
-  flat_output_types = flatten_ir_types(output_types)
+  flat_input_types, input_types_treedef = ir_tree_registry.flatten(input_types)
+  flat_output_types, _ = ir_tree_registry.flatten(output_types)
   ftype = ir.FunctionType.get(flat_input_types, flat_output_types)
   func_name = "main" if main_function else name
   func_op = func_dialect.FuncOp(func_name, ftype, ip=ctx.ip)
@@ -1872,7 +1920,9 @@ def lower_jaxpr_to_fun(
       [ir.DictAttr.get(attrs) for attrs in result_attrs])
 
   if arg_names:
-    arg_locs = [ir.Location.unknown()] * (num_dim_vars + num_tokens)
+    arg_locs: list[ir.Location] = [ir.Location.unknown()] * (
+        num_dim_vars + num_tokens
+    )
     for n in arg_names:
       arg_locs.append(ir.Location.name(n) if n else ir.Location.unknown())
     entry_block = func_op.add_entry_block(arg_locs)
@@ -1892,8 +1942,8 @@ def lower_jaxpr_to_fun(
   outer_traceback = (
       source_info_util.current().traceback if main_function else None
   )
-
-  with ir.InsertionPoint(entry_block):
+  func_loc = source_info_to_location(ctx, None, name_stack, outer_traceback)
+  with ir.InsertionPoint(entry_block), func_loc:
     flat_args = entry_block.arguments
     dim_var_values, _, const_arg_values, _ = util.split_list(
         flat_args, [num_dim_vars, num_tokens, num_const_args])
@@ -1929,10 +1979,11 @@ def lower_jaxpr_to_fun(
                                  arg_shardings)  # pyrefly: ignore[bad-argument-type]  # pyrefly#2385
       ]
 
+    unflattened_args = input_types_treedef.unflatten(flat_args)
     _, token_args, _, unflattened_args = util.split_list(
-        unflatten_ir_values_like_types(flat_args, input_types),
+        unflattened_args,
         [num_dim_vars, num_tokens, num_const_args])
-    tokens_in = TokenSet(zip(effects, token_args))
+    tokens_in = TokenSet(dict(zip(effects, token_args)))
     args: list[IrValues] = unflattened_args
     unique_consts = {
         id(c): _ir_constant(c, aval=var.aval)
@@ -1949,7 +2000,7 @@ def lower_jaxpr_to_fun(
       outs.append(tokens_out.get(eff))
     outs.extend(out_vals)
 
-    flat_outputs = flatten_ir_values(outs)
+    flat_outputs, _ = ir_tree_registry.flatten(outs)
 
     if not use_sharding_annotations and ir_result_shardings is not None:
       flat_outputs = [
@@ -1960,7 +2011,7 @@ def lower_jaxpr_to_fun(
     # transfer.
     if custom_call_ir_result_memory_kinds is not None and main_function:
       flat_outputs = [
-          o if mk is None else wrap_with_memory_kind(o, mk, o_aval)
+          o if mk is None else wrap_with_memory_kind(ctx, o, mk, o_aval)
           for o, mk, o_aval in zip(
               flat_outputs, custom_call_ir_result_memory_kinds, output_avals)]
 
@@ -1980,11 +2031,11 @@ def lower_jaxpr_to_fun(
 
 
 def wrap_with_memory_kind(
-    x: ir.Value, memory_kind: str, aval_out: core.AbstractValue) -> ir.Value:
+    ctx: ModuleContext, x: ir.Value, memory_kind: str, aval_out: core.AbstractValue) -> ir.Value:
   if aval_out is None:
     result_type = x.type
   else:
-    (result_type,) = aval_to_ir_types(aval_out)
+    (result_type,) = aval_to_ir_types(ctx, aval_out)
   op = custom_call("annotate_device_placement", result_types=[result_type],
                    operands=[x], has_side_effect=True, api_version=1)
   op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get({
@@ -2019,6 +2070,7 @@ def replicate_trailing_dims(ctx, val: ir.Value, aval) -> ir.Value:
 
 _uncacheable_primitives: set[core.Primitive] = set()
 
+_empty_token_set = TokenSet()
 
 def jaxpr_subcomp(
     ctx: ModuleContext,
@@ -2080,7 +2132,6 @@ def jaxpr_subcomp(
     (ctx.shape_poly_state.dim_vars, dim_var_values)
   foreach(write, jaxpr.constvars, consts_for_constvars)
   foreach(write, jaxpr.invars, args)
-  last_used = core.last_used(jaxpr)
   outer_traceback = outer_traceback or xc.Traceback()
   should_log_constants = (config.use_simplified_jaxpr_constants.value and
                           config.captured_constants_warn_bytes.value >= 0)
@@ -2091,52 +2142,62 @@ def jaxpr_subcomp(
           log_closed_over_constant(v, eqn, jaxpr._debug_info)
 
     in_nodes = tuple(map(read, eqn.invars))
-    assert all(_is_ir_values(v) for v in in_nodes), (eqn, in_nodes)
-
-    avals_in = tuple(v.aval for v in eqn.invars)
-    ordered_effects = list(effects_lib.ordered_effects.filter_in(eqn.effects))
-    tokens_in = tokens.subset(ordered_effects)
 
     eqn_name_stack = name_stack + eqn.source_info.name_stack
     traceback = (eqn.source_info.traceback or xc.Traceback()) + outer_traceback
-    loc = source_info_to_location(ctx, eqn.primitive, eqn_name_stack, traceback)
-    with (source_info_util.user_context(eqn.source_info.traceback), loc,
-          eqn.ctx.manager):
-      # TODO(mattjj, phawkins): support caching for dynamic shapes.
-      can_cache_lowering = (
-          eqn.primitive not in _uncacheable_primitives)
-      if can_cache_lowering:
-        loc = source_info_to_location(ctx, None, eqn_name_stack, traceback)
-        with loc:
-          out_nodes, tokens_out = _cached_lowering(
-              ctx, eqn, tokens_in, tuple(dim_var_values), const_lowering,
-              *in_nodes, **eqn.params,
+
+    can_cache_lowering = (eqn.primitive not in _uncacheable_primitives)
+    avals_in = tuple(v.aval for v in eqn.invars)
+
+    if can_cache_lowering:
+      cache_key = LoweringCacheKey(
+          primitive=eqn.primitive,
+          eqn_ctx=eqn.ctx,
+          avals_in=avals_in,
+          effects=frozenset(eqn.effects),
+          params=tuple(sorted(eqn.params.items())),
+          platforms=tuple(ctx.platforms),
+      )
+      cache_entry = ctx.lowering_cache.get(cache_key, None)
+      loc = source_info_to_location(ctx, None, eqn_name_stack, traceback)
+      with loc:
+        if cache_entry is None:
+          assert cache_key is not None
+          cache_entry = _cached_lowering_miss(
+              ctx, eqn, cache_key, avals_in, **eqn.params
           )
-      else:
-        # If we cannot cache the lowering, lower inline.
+        out_nodes, tokens_out = _emit_cached_call(
+            ctx, eqn, tokens, tuple(dim_var_values), const_lowering,
+            cache_entry, *in_nodes
+        )
+    else:
+      # If we cannot cache the lowering, lower inline.
+      loc = source_info_to_location(ctx, eqn.primitive, eqn_name_stack, traceback)
+      with (source_info_util.user_context(eqn.source_info.traceback), loc,
+            eqn.ctx.manager):
         axis_size_env = None
         rule_ctx = LoweringRuleContext(
             module_context=ctx, primitive=eqn.primitive,
             name_stack=eqn_name_stack,
-            traceback=eqn.source_info.traceback,
+            traceback=traceback,
             avals_in=avals_in,
-            avals_out=tuple(v.aval for v in eqn.outvars), tokens_in=tokens_in,
+            avals_out=tuple(v.aval for v in eqn.outvars), tokens_in=tokens,
             tokens_out=None, jaxpr_eqn_ctx=eqn.ctx,
             dim_var_values=dim_var_values,
             axis_size_env=axis_size_env,
             const_lowering=const_lowering)
-        out_nodes, _inline = _uncached_lowering(
-            eqn.primitive, eqn.ctx, eqn.effects, rule_ctx, *in_nodes,
+        platform_rules, default_rule, _ = _get_lowering_rules(
+            ctx, eqn.primitive, eqn.ctx)
+        out_nodes = _uncached_lowering(
+            eqn.primitive, eqn.ctx, eqn.effects, platform_rules, default_rule,
+            rule_ctx, *in_nodes,
             **eqn.params)
         tokens_out = rule_ctx.tokens_out
 
-      assert len(out_nodes) == len(eqn.outvars), (out_nodes, eqn)
-      if ordered_effects:
-        assert tokens_out is not None
-        tokens = tokens.update_tokens(tokens_out)
+    if tokens_out is not None:
+      tokens = tokens_out
 
     foreach(write, eqn.outvars, out_nodes)
-    core.clean_up_dead_vars(eqn, env, last_used)
   return tuple(read(v) for v in jaxpr.outvars), tokens
 
 
@@ -2146,72 +2207,109 @@ class CachedLoweringRule(Protocol):
       ctx: LoweringRuleContext,
       *args: ir.Value | Sequence[ir.Value],
       **kwargs: Any,
-  ) -> tuple[Sequence[ir.Value | Sequence[ir.Value]], bool]:
+  ) -> Sequence[ir.Value | Sequence[ir.Value]]:
       ...
 
 
-def _cached_lowering(
+def _cached_lowering_miss(
     ctx: ModuleContext,
     eqn: core.JaxprEqn,
-    tokens_in: TokenSet,
-    dim_var_values: tuple[ir.Value, ...],
-    const_lowering: dict[tuple[int, core.AbstractValue], IrValues],
-    *args,
+    cache_key: LoweringCacheKey,
+    avals_in: tuple[core.AbstractValue, ...],
     **params,
-) -> tuple[Sequence[IrValues], TokenSet]:
-  """Lowers a jaxpr equation, using a cache.
+) -> LoweringCacheValue:
+  """Lowers a jaxpr equation and populates the cache.
 
   The jaxpr equation's lowering is emitted as an out-of-line MLIR function, and
   that function's construction is cached in the event that we see a similar
   equation. For each such equation we either inline the function body or emit
   an out-of-line call to it, depending on whether any of the lowering rules
   opted out of inlining."""
-  avals_in = tuple(v.aval for v in eqn.invars)
-  ordered_effects = list(effects_lib.ordered_effects.filter_in(eqn.effects))
-  cache_key = LoweringCacheKey(
-      primitive=eqn.primitive,
-      eqn_ctx=eqn.ctx,
-      avals_in=avals_in,
-      effects=frozenset(eqn.effects),
-      params=tuple(sorted(eqn.params.items())),
-      platforms=tuple(ctx.platforms),
-  )
-  try:
-    cache_entry = ctx.lowering_cache.get(cache_key, None)
-  except TypeError:
-    print("Unable to hash key: ", eqn)
-    raise
-  if cache_entry is None:
+  ordered_effects = (tuple(effects_lib.ordered_effects.filter_in(eqn.effects))
+                     if eqn.effects else ())
+  platform_rules, default_rule, inline = _get_lowering_rules(
+      ctx, eqn.primitive, eqn.ctx)
+  with (source_info_util.user_context(eqn.source_info.traceback),
+        eqn.ctx.manager):
     avals_out = map(lambda v: v.aval, eqn.outvars)
     cache_entry = _emit_lowering_rule_as_fun(
-        partial(_uncached_lowering, eqn.primitive, eqn.ctx, eqn.effects),
+        partial(_uncached_lowering, eqn.primitive, eqn.ctx, eqn.effects,
+                platform_rules, default_rule),
         ctx, eqn.ctx, eqn.primitive, ordered_effects, avals_in, avals_out,
-        **params,
+        inline, **params,
     )
     ctx.lowering_cache[cache_key] = cache_entry
+    return cache_entry
 
-  tokens_in_args = tuple(tokens_in.get(eff) for eff in ordered_effects)
+
+def _emit_cached_call(
+    ctx: ModuleContext,
+    eqn: core.JaxprEqn,
+    tokens_in: TokenSet,
+    dim_var_values: tuple[ir.Value, ...],
+    const_lowering: dict[tuple[int, core.AbstractValue], IrValues],
+    cache_entry: LoweringCacheValue,
+    *args,
+) -> tuple[Sequence[IrValues], TokenSet]:
+  """Emits a call to an already cached lowering function."""
   const_arg_values = tuple(
       ir_constants(c, const_lowering=const_lowering, aval=aval)
       for c, aval in zip(cache_entry.const_args, cache_entry.const_arg_avals)
   )
-  args = flatten_ir_values(
+  if not eqn.effects:
+    ordered_effects = ()
+    tokens_in_args = ()
+  else:
+    ordered_effects = list(effects_lib.ordered_effects.filter_in(eqn.effects))
+    tokens_in_args = tuple(tokens_in.get(eff) for eff in ordered_effects)
+
+  flat_args, _ = ir_tree_registry.flatten(
       dim_var_values + tokens_in_args + const_arg_values + args)
   if cache_entry.inline:
-    if jaxlib_extension_version >= 443:
-      outs = jax_mlir_ext.inlined_func_call(cache_entry.func.operation, args)
-    else:
-      outs = jax_mlir_ext.inlined_func_call(
-          cache_entry.func, args, ir.InsertionPoint.current.block)  # pyrefly: ignore[bad-argument-type]
+    outs = jax_mlir_ext.inlined_func_call(cache_entry.func.operation, flat_args)
   else:
     outs = func_dialect.CallOp(
-        flatten_ir_types(cache_entry.output_types),
+        cache_entry.flat_output_types,
         ir.FlatSymbolRefAttr.get(cache_entry.func.sym_name.value),
-        args
+        flat_args
     ).results
-  out_nodes = unflatten_ir_values_like_types(outs, cache_entry.output_types)
+  out_nodes = cache_entry.output_treedef.unflatten(outs)
+
+  if not eqn.effects:
+    return out_nodes, tokens_in
+
   token_outs, out_nodes = util.split_list(out_nodes, [len(ordered_effects)])
-  return out_nodes, TokenSet(zip(ordered_effects, token_outs))
+  return out_nodes, tokens_in.update_tokens(TokenSet(dict(zip(ordered_effects, token_outs))))
+
+
+def _get_lowering_rules(
+    ctx: ModuleContext, primitive: core.Primitive,
+    eqn_ctx: core.JaxprEqnContext | None
+) -> tuple[dict[str, LoweringRule], LoweringRule | None, bool]:
+  override_rule = _get_override_lowering_rule(ctx, primitive)
+  # See lower_per_platform for meaning of `platform_rules` and `default_rule`
+  platform_rules: dict[str, LoweringRule] = {}
+  default_rule: LoweringRule | None = None
+  inline = True  # Should calls to this lowering rule be inlined?
+
+  if override_rule is not None:
+    default_rule = override_rule
+    assert not isinstance(default_rule, LoweringRuleEntry)
+  else:
+    # First the platform-specific rules
+    for p in _platforms_for_eqn_ctx(eqn_ctx) or ctx.platforms:
+      if primitive in _platform_specific_lowerings[p]:
+        r = _platform_specific_lowerings[p][primitive]
+        platform_rules[p] = r.rule
+        inline = inline and r.inline
+    # Now the default rule
+    if primitive in _lowerings:
+      r = _lowerings[primitive]
+      default_rule = r.rule
+      assert not isinstance(default_rule, LoweringRuleEntry)
+      inline = inline and r.inline
+
+  return platform_rules, default_rule, inline
 
 
 def _emit_lowering_rule_as_fun(
@@ -2222,36 +2320,36 @@ def _emit_lowering_rule_as_fun(
     ordered_effects: Sequence[core.Effect],
     avals_in: Sequence[core.AbstractValue],
     avals_out: Sequence[core.AbstractValue],
+    inline: bool,
     **params,
 ) -> LoweringCacheValue:
   """Emits the contents of a lowering rule as a private function."""
   num_dim_vars = len(ctx.shape_poly_state.dim_vars)
   # TODO(necula) maybe only pass the dim_vars if they are needed?
   dim_var_types = [
-    aval_to_ir_type(core.ShapedArray((), dtypes.default_int_dtype()))
+      aval_to_ir_type(ctx, core.ShapedArray((), dtypes.default_int_dtype()))
   ] * num_dim_vars
 
   const_args, const_arg_avals = util.unzip2(core.eqn_params_const_args(params))
 
-  input_types = map(
-      _aval_to_ir_types, itertools.chain(const_arg_avals, avals_in)
-  )
-  output_types = map(_aval_to_ir_types, avals_out)
+  input_types = [_aval_to_ir_types(ctx, a) for a in itertools.chain(const_arg_avals, avals_in)]
+  output_types = [_aval_to_ir_types(ctx, a) for a in avals_out]
   token_types = [token_type() for _ in ordered_effects]
   input_types = [*dim_var_types, *token_types, *input_types]
   output_types = [*token_types, *output_types]
 
-  flat_input_types = flatten_ir_types(input_types)
-  flat_output_types = flatten_ir_types(output_types)
+  flat_input_types, input_treedef = ir_tree_registry.flatten(input_types)
+  flat_output_types, output_treedef = ir_tree_registry.flatten(output_types)
   ftype = ir.FunctionType.get(flat_input_types, flat_output_types)
-  func_op = func_dialect.FuncOp(primitive.name, ftype,
-                                ip=ctx.ip)
-  func_op.attributes["sym_visibility"] = ir.StringAttr.get("private")
-  ctx.symbol_table.insert(func_op).value
+  if inline:
+    func_op = func_dialect.FuncOp(primitive.name, ftype, ip=False)
+  else:
+    func_op = func_dialect.FuncOp(primitive.name, ftype, ip=ctx.ip)
+    func_op.attributes["sym_visibility"] = ir.StringAttr.get("private")
+    ctx.symbol_table.insert(func_op).value
   entry_block = func_op.add_entry_block()
   with ir.InsertionPoint(entry_block):
-    unflattened_args = unflatten_ir_values_like_types(
-      entry_block.arguments, input_types)
+    unflattened_args = input_treedef.unflatten(entry_block.arguments)
     dim_var_values, token_args, const_arg_values, unflattened_args = \
       util.split_list(unflattened_args,
                       [num_dim_vars, len(ordered_effects), len(const_args)])
@@ -2259,28 +2357,29 @@ def _emit_lowering_rule_as_fun(
         (id(c), aval): c_arg
         for c, aval, c_arg in zip(const_args, const_arg_avals, const_arg_values)
     }
+    flat_dim_var_values, _ = ir_tree_registry.flatten(dim_var_values)
     sub_ctx = LoweringRuleContext(
         module_context=ctx, primitive=primitive,
         name_stack=source_info_util.new_name_stack(),
         traceback=None,
         avals_in=avals_in, avals_out=avals_out,
-        tokens_in=TokenSet(zip(ordered_effects, token_args)),
+        tokens_in=TokenSet(dict(zip(ordered_effects, token_args))),
         tokens_out=None, jaxpr_eqn_ctx=eqn_ctx,
-        dim_var_values=flatten_ir_values(dim_var_values),
+        dim_var_values=flat_dim_var_values,
         const_lowering=const_lowering)
     with source_info_to_location(
       ctx, primitive, source_info_util.new_name_stack(), None
     ):
-      outs, inline = lowering_rule(sub_ctx, *unflattened_args, **params)
+      outs = lowering_rule(sub_ctx, *unflattened_args, **params)
     if sub_ctx.tokens_out:
       outs = [
           *(sub_ctx.tokens_out.get(eff) for eff in ordered_effects),
           *outs
       ]
-    outs = flatten_ir_values(outs)  # pyrefly: ignore[bad-argument-type]
-    func_dialect.return_(outs)
-  return LoweringCacheValue(func_op, output_types, const_args, const_arg_avals,
-                            inline)
+    flat_outs, _ = ir_tree_registry.flatten(outs)
+    func_dialect.return_(flat_outs)
+  return LoweringCacheValue(func_op, flat_output_types, output_treedef,
+                            const_args, const_arg_avals, inline)
 
 
 def _get_override_lowering_rule(
@@ -2297,31 +2396,12 @@ def _uncached_lowering(
     primitive: core.Primitive,
     eqn_ctx: core.JaxprEqnContext,
     effects: effects_lib.Effects,
+    platform_rules: dict[str, LoweringRule],
+    default_rule: LoweringRule | None,
     ctx: LoweringRuleContext,
     *args,
     **params,
 ):
-  inline = True  # Should calls to this lowering rule be inlined?
-  override_rule = _get_override_lowering_rule(ctx.module_context, primitive)
-  platform_rules: dict[str, LoweringRule] = {}
-  default_rule: LoweringRule | None = None
-  # See mlir.lower_per_platform for meaning of `platform_rules` and `default_rule`
-  if override_rule is not None:
-    default_rule = override_rule
-    assert not isinstance(default_rule, LoweringRuleEntry)
-  else:
-    # First the platform-specific rules
-    for p in _platforms_for_eqn_ctx(eqn_ctx) or ctx.module_context.platforms:
-      if primitive in _platform_specific_lowerings[p]:
-        r = _platform_specific_lowerings[p][primitive]
-        platform_rules[p] = r.rule
-        inline = inline and r.inline
-    # Now the default rule
-    if primitive in _lowerings:
-      r = _lowerings[primitive]
-      default_rule = r.rule
-      assert not isinstance(default_rule, LoweringRuleEntry)
-      inline = inline and r.inline
 
   assert not isinstance(default_rule, LoweringRuleEntry)
   assert not any(isinstance(r, LoweringRuleEntry) for r in platform_rules.values())
@@ -2333,7 +2413,8 @@ def _uncached_lowering(
     raise ValueError("Output of translation rule must be iterable: "
                       f"{primitive}, got output {ans}") from e
 
-  if ctx.tokens_in.effects():
+  ordered_effects = list(effects_lib.ordered_effects.filter_in(effects))
+  if ordered_effects:
     # If there were ordered effects in the primitive, there should be output
     # tokens we need for subsequent ordered effects.
     tokens_out = ctx.tokens_out
@@ -2347,7 +2428,7 @@ def _uncached_lowering(
           f" tokens. Expected: {tuple(ctx.tokens_in.effects())} vs. Actual:"
           f" {tuple(tokens_out.effects())}"
       )
-  return rets, inline
+  return rets
 
 
 def _platforms_for_eqn_ctx(eqn_ctx: core.JaxprEqnContext | None
@@ -2367,6 +2448,8 @@ def _platforms_for_eqn(ctx: LoweringRuleContext) -> tuple[str, ...]:
                ctx.platforms or ctx.module_context.platforms)
 
 def _get_owner(v):
+  if isinstance(v, ir.Operation):
+    return v
   if isinstance(v, ir.BlockArgument):
     return v.owner
   owner = v.owner
@@ -2449,15 +2532,14 @@ def lower_per_platform(ctx: LoweringRuleContext,
   assert kept_rules
   # If there is a single rule left just apply the rule, without conditionals.
   if len(kept_rules) == 1:
-    output = type_cast(
-        Sequence[IrValues], kept_rules[0](ctx, *rule_args, **rule_kwargs)
-    )
-    flat_output = flatten_ir_values(output)
-    for o in flat_output:
+    rule, = kept_rules
+    output = type_cast(Sequence[IrValues], rule(ctx, *rule_args, **rule_kwargs))
+    flat_output, _ = ir_tree_registry.flatten(output)
+    for o, a in zip(flat_output, ctx.avals_out):
       if not isinstance(o, ir.BlockArgument):
-        owner = _get_owner(o)
-        wrap_compute_type_in_place(ctx, owner)
-        wrap_xla_metadata_in_place(ctx, owner)
+        check_unreduced_constraint(o, a)
+        wrap_compute_type_in_place(ctx, o)
+        wrap_xla_metadata_in_place(ctx, o)
     return flat_output
 
   assert len(platforms) > 1 and len(kept_rules) >= 2, (platforms, kept_rules)
@@ -2466,7 +2548,7 @@ def lower_per_platform(ctx: LoweringRuleContext,
   # The first dim_var_values is the platform index
   current_platform_idx = ctx.dim_var_values[0]
   # Compute the rule index based on the current platform
-  i32_type = aval_to_ir_type(core.ShapedArray((), dtype=np.int32))
+  i32_type = aval_to_ir_type(ctx.module_context, core.ShapedArray((), dtype=np.int32))
   if current_platform_idx.type != i32_type:
     current_platform_idx = hlo.convert(i32_type, current_platform_idx)
   rule_idx_op = hlo.CaseOp([i32_type],
@@ -2478,30 +2560,30 @@ def lower_per_platform(ctx: LoweringRuleContext,
       hlo.return_([ir_constant(np.int32(platform_to_kept_rules_idx[p]))])
   ordered_effects = effects_lib.ordered_effects.filter_in(effects)
   rule_out_avals = [core.abstract_token] * len(ordered_effects) + ctx.avals_out
-  output_types = map(_aval_to_ir_types, rule_out_avals)
-  case_op = hlo.CaseOp(flatten_ir_types(output_types),
+  output_types = [_aval_to_ir_types(ctx.module_context, a) for a in rule_out_avals]
+  flat_output_types, output_types_treedef = ir_tree_registry.flatten(output_types)
+  case_op = hlo.CaseOp(flat_output_types,
                       index=rule_idx_op.result,
                       num_branches=len(kept_rules))
   for i, rule in enumerate(kept_rules):
-    platforms_for_this_rule = [p
-                               for p, rule_idx in platform_to_kept_rules_idx.items()
-                               if rule_idx == i]
-    inner_ctx = ctx.replace(platforms=platforms_for_this_rule)
+    platforms_for_rule = [p for p, rule_idx in platform_to_kept_rules_idx.items()
+                          if rule_idx == i]
+    inner_ctx = ctx.replace(platforms=platforms_for_rule)
     branch = case_op.regions[i].blocks.append()
     with ir.InsertionPoint(branch):
       output = type_cast(
           Sequence[IrValues], rule(inner_ctx, *rule_args, **rule_kwargs)
       )
       try:
-        out_nodes = flatten_ir_values(output)
+        out_nodes, _ = ir_tree_registry.flatten(output)
       except TypeError as e:
         raise ValueError("Output of translation rule must be iterable: "
                         f"{description}, got output {output}") from e
-      for o in out_nodes:
+      for o, a in zip(out_nodes, ctx.avals_out):
         if not isinstance(o, ir.BlockArgument):
-          owner = _get_owner(o)
-          wrap_compute_type_in_place(ctx, owner)
-          wrap_xla_metadata_in_place(ctx, owner)
+          check_unreduced_constraint(o, a)
+          wrap_compute_type_in_place(ctx, o)
+          wrap_xla_metadata_in_place(ctx, o)
       if inner_ctx.tokens_out is not None:
         assert len(ordered_effects) == len(inner_ctx.tokens_out)
         out_nodes = [inner_ctx.tokens_out.get(eff)
@@ -2510,11 +2592,12 @@ def lower_per_platform(ctx: LoweringRuleContext,
 
   results: Any = case_op.results
   if ordered_effects:
+    unflattened_results = output_types_treedef.unflatten(results)
     tokens, results = util.split_list(
-      unflatten_ir_values_like_types(results, output_types),
+      unflattened_results,
       [len(ordered_effects)])
-    tokens_out = ctx.tokens_in.update_tokens(TokenSet(zip(ordered_effects,
-                                                          tokens)))
+    tokens_out = ctx.tokens_in.update_tokens(
+        TokenSet(dict(zip(ordered_effects, tokens))))
     ctx.set_tokens_out(tokens_out)
   return results
 
@@ -2608,7 +2691,7 @@ def lower_called_computation(
   assert isinstance(call_jaxpr, core.ClosedJaxpr), type(call_jaxpr)
   check_backend_matches(backend, ctx.platforms)
   effects = list(tokens_in.effects())
-  output_types = map(_aval_to_ir_types, out_avals)
+  output_types = [_aval_to_ir_types(ctx, a) for a in out_avals]
   output_types = [token_type()] * len(effects) + output_types
   func_op = _lower_jaxpr_to_fun_cached(
       ctx, fn_name, call_jaxpr, num_const_args, effects, in_avals=in_avals,
@@ -2638,17 +2721,18 @@ def call_lowering(fn_name, call_jaxpr: core.ClosedJaxpr, backend,
       tokens_in,
       backend=backend, arg_names=arg_names, result_names=result_names)
   symbol_name = func_op.name.value
-  flat_output_types = flatten_ir_types(output_types)
+  flat_output_types, treedef = ir_tree_registry.flatten(output_types)
   tokens = [tokens_in.get(eff) for eff in effects]
   args = (*dim_var_values, *tokens, *args)
+  flat_args, _ = ir_tree_registry.flatten(args)
   call = func_dialect.CallOp(flat_output_types,
                              ir.FlatSymbolRefAttr.get(symbol_name),
-                             flatten_ir_values(args))
+                             flat_args)
   if attributes:
     call.operation.attributes['mhlo.frontend_attributes'] = ir.DictAttr.get(attributes)
-  out_nodes = unflatten_ir_values_like_types(call.results, output_types)
+  out_nodes = treedef.unflatten(call.results)
   tokens, out_nodes = util.split_list(out_nodes, [len(effects)])
-  tokens_out = tokens_in.update_tokens(TokenSet(zip(effects, tokens)))
+  tokens_out = tokens_in.update_tokens(TokenSet(dict(zip(effects, tokens))))
   return out_nodes, tokens_out
 
 def core_call_lowering(ctx: LoweringRuleContext,
@@ -2656,12 +2740,14 @@ def core_call_lowering(ctx: LoweringRuleContext,
                        call_jaxpr: core.ClosedJaxpr | core.Jaxpr):
   if isinstance(call_jaxpr, core.Jaxpr):
     call_jaxpr = pe.close_jaxpr(call_jaxpr)
+  effects = list(effects_lib.ordered_effects.filter_in(call_jaxpr.effects))
+  tokens_in = ctx.tokens_in.subset(effects)
   out_nodes, tokens = call_lowering(
       name, call_jaxpr, backend, ctx.module_context,
-      ctx.avals_in, ctx.avals_out, ctx.tokens_in, *args,
+      ctx.avals_in, ctx.avals_out, tokens_in, *args,
       dim_var_values=ctx.dim_var_values,
       const_lowering=ctx.const_lowering)
-  ctx.set_tokens_out(tokens)
+  ctx.set_tokens_out(ctx.tokens_in.update_tokens(tokens))
   return out_nodes
 
 register_lowering(core.call_p, partial(core_call_lowering, name="core_call"))
@@ -2682,15 +2768,20 @@ def map_compute_type(c_type: str) -> str:
 
 
 def _update_frontend_attributes(op, attrs):
+  if isinstance(op, ir.Block):
+    return
   if attr_array := op.attributes.get("mhlo.frontend_attributes"):
     assert isinstance(attr_array, ir.DictAttr)
     attrs |= {a.name: a.attr for a in attr_array}
   op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(attrs)
 
 
-def wrap_compute_type_in_place(ctx: LoweringRuleContext, op: ir.Operation) -> None:
+# TODO(yashkatariya): Delete this after legacy compute_on is deleted.
+def wrap_compute_type_in_place(ctx: LoweringRuleContext,
+                               op: ir.Value | ir.Operation) -> None:
   if ctx.jaxpr_eqn_ctx is None or ctx.jaxpr_eqn_ctx.compute_type is None:
     return
+  op = _get_owner(op)
 
   if ctx.jaxpr_eqn_ctx.compute_type.startswith("gpu_stream:"):
     _, stream = ctx.jaxpr_eqn_ctx.compute_type.split(":", 1)
@@ -2703,21 +2794,42 @@ def wrap_compute_type_in_place(ctx: LoweringRuleContext, op: ir.Operation) -> No
         "_xla_compute_type": ir.StringAttr.get(
             map_compute_type(ctx.jaxpr_eqn_ctx.compute_type))
     }
-
   _update_frontend_attributes(op, dict_attr)
 
 
-def wrap_xla_metadata_in_place(ctx: LoweringRuleContext, op: ir.Operation) -> None:
+def wrap_xla_metadata_in_place(ctx: LoweringRuleContext,
+                               op: ir.Value | ir.Operation) -> None:
   if ctx.jaxpr_eqn_ctx is None:
     return
   if not ctx.jaxpr_eqn_ctx.xla_metadata:
     return
-  ctx_attributes = {
-      k: ir.StringAttr.get(str(v).lower())
-      for k, v in ctx.jaxpr_eqn_ctx.xla_metadata.items()
-  }
-  if isinstance(op, ir.Operation):
-    _update_frontend_attributes(op, ctx_attributes)
+  op = _get_owner(op)
+  if not isinstance(op, ir.Operation):
+    return
+  ctx_attributes = {}
+  for k, v in ctx.jaxpr_eqn_ctx.xla_metadata.items():
+    v_str = str(v).lower() if isinstance(v, bool) else str(v)
+    ctx_attributes[k] = ir.StringAttr.get(v_str)
+  _update_frontend_attributes(op, ctx_attributes)
+
+
+def check_unreduced_constraint(op: ir.Value | ir.Operation, aval) -> None:
+  if not isinstance(aval, core.ShapedArray):
+    return
+  if not aval.sharding.spec.unreduced:
+    return
+  if isinstance(op, ir.Value):
+    op = op.owner.operation if isinstance(op.owner, ir.OpView) else op.owner  # type: ignore
+  assert isinstance(op, ir.Operation)
+  if op.name in ("func.call", "sdy.manual_computation", "mpmd.named_computation"):
+    return
+  assert op.name == "sdy.sharding_constraint", (
+      f"Expected last op to be sdy.sharding_constraint, but got: {op.name} and "
+      f"output type={aval.str_short(True)}")
+  sharding = sdy.TensorShardingAttr(op.attributes["sharding"])
+  assert sharding.unreduced_axes, (
+      "Expected sdy.sharding_constraint to have unreduced_axes populated, "
+      f"but got: {sharding} and output type={aval.str_short(True)}")
 
 
 def broadcast_in_dim(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue, *,
@@ -2735,7 +2847,7 @@ def broadcast_in_dim(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue,
   else:
     if not core.is_constant_shape(aval_out.shape):  # pyrefly: ignore[missing-attribute]
       shape = eval_dynamic_shape_as_tensor(ctx, aval_out.shape)  # pyrefly: ignore[missing-attribute]
-      (result_type,) = aval_to_ir_types(aval_out)
+      (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
       out = hlo.dynamic_broadcast_in_dim(
           result_type, op,
           shape,
@@ -2744,11 +2856,11 @@ def broadcast_in_dim(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue,
     else:
       assert all(d != ir.ShapedType.get_dynamic_size()
                  for d in aval_out.shape), aval_out  # pyrefly: ignore[missing-attribute]
-      (result_type,) = aval_to_ir_types(aval_out)
+      (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
       out = hlo.broadcast_in_dim(
           result_type, op,
           dense_int_array(broadcast_dimensions))
-    wrap_compute_type_in_place(ctx, _get_owner(out))
+    wrap_compute_type_in_place(ctx, out)
     return out
 
 def multi_broadcast_in_dim(ctx: LoweringRuleContext,
@@ -2785,12 +2897,12 @@ def reshape(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue) -> ir.Va
   aval_out = core.physical_aval(aval_out)
   if not core.is_constant_shape(aval_out.shape):  # pyrefly: ignore[missing-attribute]
     shape = eval_dynamic_shape_as_tensor(ctx, aval_out.shape)  # pyrefly: ignore[missing-attribute]
-    (result_type,) = aval_to_ir_types(aval_out)
+    (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
     return hlo.dynamic_reshape(
         result_type, op, shape,
     )
   else:
-    (result_type,) = aval_to_ir_types(aval_out)
+    (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
     return hlo.reshape(result_type, op)
 
 def slice_op(ctx: LoweringRuleContext, x, aval_out, *,
@@ -2810,7 +2922,7 @@ def slice_op(ctx: LoweringRuleContext, x, aval_out, *,
       start_indices = eval_dynamic_shape_as_tensor(ctx, start_indices)
       limit_indices = eval_dynamic_shape_as_tensor(ctx, limit_indices)
       strides = eval_dynamic_shape_as_tensor(ctx, strides)
-      (result_type,) = aval_to_ir_types(aval_out)
+      (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
       return hlo.real_dynamic_slice(
         result_type,
         x, start_indices, limit_indices, strides)
@@ -2839,17 +2951,17 @@ def dynamic_slice(ctx: LoweringRuleContext, aval_out, x, *,
     # not have the clamping behavior. We clamp start ourselves.
     slice_sizes = eval_dynamic_shape_as_tensor(ctx, slice_sizes)
     clamped_start = hlo.clamp(
-      shape_tensor([0] * len(start_indices)),
-      shape_tensor(start_indices),
+      shape_tensor(ctx.module_context, [0] * len(start_indices)),
+      shape_tensor(ctx.module_context, start_indices),
       hlo.subtract(
         eval_dynamic_shape_as_tensor(ctx, x_aval.shape),  # pyrefly: ignore[missing-attribute]
         slice_sizes))
-    (result_type,) = aval_to_ir_types(aval_out)
+    (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
     return hlo.real_dynamic_slice(
         result_type, x,
         clamped_start,
         hlo.add(clamped_start, slice_sizes),
-        shape_tensor([1] * len(start_indices))
+        shape_tensor(ctx.module_context, [1] * len(start_indices))
     )
   else:
     return hlo.dynamic_slice(x, start_indices, dense_int_array(slice_sizes))
@@ -2882,7 +2994,7 @@ def pad(ctx: LoweringRuleContext, aval_out,
     padding_low = eval_dynamic_shape_as_tensor(ctx, padding_low)
     padding_high = eval_dynamic_shape_as_tensor(ctx, padding_high)
     padding_interior = eval_dynamic_shape_as_tensor(ctx, padding_interior)
-    (result_type,) = aval_to_ir_types(aval_out)
+    (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
     return hlo.dynamic_pad(
         result_type,
         x, padding_value, padding_low, padding_high, padding_interior)
@@ -2890,14 +3002,14 @@ def pad(ctx: LoweringRuleContext, aval_out,
 def iota(ctx: LoweringRuleContext, aval_out, *, dimension: int):
   if not core.is_constant_shape(aval_out.shape):
     shape = eval_dynamic_shape_as_tensor(ctx, aval_out.shape)
-    (result_type,) = aval_to_ir_types(aval_out)
+    (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
     return hlo.dynamic_iota(
         result_type,
         shape,
         i64_attr(dimension),
     )
   else:
-    (result_type,) = aval_to_ir_types(aval_out)
+    (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
     return hlo.iota(result_type, i64_attr(dimension))
 
 def full_like_aval(ctx: LoweringRuleContext, value, aval: core.ShapedArray) -> ir.Value:
@@ -2966,7 +3078,7 @@ def convert_hlo(ctx: LoweringRuleContext, x, aval_in, aval_out):
       compare_type = "UNSIGNED"
     x = compare_hlo(x, full_like_aval(ctx, 0, aval_in), "NE", compare_type)
     # continue, to adjust the shape if needed
-  (result_type,) = aval_to_ir_types(aval_out)
+  (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
   return hlo.convert(result_type, x)
 
 def _wrap_with_spmd_op(name: str,
@@ -2978,7 +3090,8 @@ def _wrap_with_spmd_op(name: str,
                        has_side_effect: bool = False,
                        allow_shardy_lowering: bool = False):
   if config.use_shardy_partitioner.value and allow_shardy_lowering:
-    return dialects.sdy.sharding_constraint(x, sharding.build(ctx.module_context.sharding_attr_cache))  # pyrefly: ignore[missing-attribute]
+    return dialects.sdy.sharding_constraint(
+        x, sharding.build(ctx.module_context.sharding_attr_cache))  # type: ignore
 
   # unspecified_dims indicate dimensions whose shardings are not specified and
   # XLA sharding propagation can change them.
@@ -2987,8 +3100,8 @@ def _wrap_with_spmd_op(name: str,
         [str(i) for i in sorted(unspecified_dims)]) + "]"
   else:
     backend_config = ""
-  (result_type,) = aval_to_ir_types(aval_out)
-  out_shape = core.physical_aval(aval_out).shape  # pyrefly: ignore[missing-attribute]
+  (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
+  out_shape = core.physical_aval(aval_out).shape  # type: ignore
   if core.is_constant_shape(out_shape):
     result_shapes = None
   else:
@@ -3061,7 +3174,7 @@ def wrap_with_layout_op(ctx: LoweringRuleContext,
                         aval_out: core.AbstractValue,
                         layout: Layout,
                         aval_in: core.AbstractValue):
-  (result_type,) = aval_to_ir_types(aval_out)
+  (result_type,) = aval_to_ir_types(ctx.module_context, aval_out)
   out_shape = core.physical_aval(aval_out).shape  # pyrefly: ignore[missing-attribute]
   if core.is_constant_shape(out_shape):
     result_shapes = None
@@ -3304,12 +3417,13 @@ def reduce_window(
     window_dimensions, window_strides, padding, base_dilation, window_dilation):
   """Builds a ReduceWindowOp, with support for dynamic shapes."""
 
-  scalar_types = flatten_ir_types(map(aval_to_ir_types, init_values_avals))
+  scalar_types, _ = ir_tree_registry.flatten(map(partial(_aval_to_ir_types, ctx.module_context), init_values_avals))
+  flat_result_types, _ = ir_tree_registry.flatten(map(partial(_aval_to_ir_types, ctx.module_context), out_avals))
   if any(not core.is_constant_shape(s)
          for s in [window_dimensions, window_dilation, window_strides, base_dilation, *padding]):
     # d_padding will be an array i32[N, 2] with pad_lo and pad_hi for each
     # spatial dimension.
-    int2d = aval_to_ir_type(core.ShapedArray((1, 2), np.int32))
+    int2d = aval_to_ir_type(ctx.module_context, core.ShapedArray((1, 2), np.int32))
     def prep_one_pad(pad_lo_hi: tuple[core.DimSize, core.DimSize]):
       pads = eval_dynamic_shape_as_tensor(ctx, pad_lo_hi)  # i32[2]
       return hlo.reshape(int2d, pads)
@@ -3326,7 +3440,7 @@ def reduce_window(
 
     rw = custom_call(
       "stablehlo.dynamic_reduce_window",
-      result_types=flatten_ir_types(map(aval_to_ir_types, out_avals)),
+      result_types=flat_result_types,
       operands=[
         *operands, *init_values,
         eval_dynamic_shape_as_tensor(ctx, window_dimensions),
@@ -3338,7 +3452,7 @@ def reduce_window(
     )
   else:  # Static shapes
     rw = hlo.ReduceWindowOp(
-        flatten_ir_types(map(aval_to_ir_types, out_avals)),
+        flat_result_types,
         operands, init_values,
         dense_int_array(window_dimensions),
         window_strides=dense_int_array(window_strides),

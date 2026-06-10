@@ -26,6 +26,7 @@ concurrency:
 
 jobs:
   build-jax-artifact:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/build_artifacts.yml
     name: "Build jax artifact"
     with:
@@ -36,6 +37,7 @@ jobs:
         upload_artifacts_to_gcs: false
 
   build-jaxlib-artifact:
+    if: github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/build_artifacts.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -52,11 +54,11 @@ jobs:
         runner: ${{ matrix.runner }}
         artifact: ${{ matrix.artifact }}
         python: ${{ matrix.python }}
-        clone_main_xla: 1
+        clone_main_xla: 0
         upload_artifacts_to_gcs: false
 
   run_tests:
-    if: github.event.repository.fork == false
+    if: github.event.repository.fork == false && github.repository_owner == 'jax-ml'
     uses: ./.github/workflows/bazel_cpu.yml
 # Begin Presubmit Naming Check - name modification requires internal check to be updated
     strategy:
@@ -91,4 +93,4 @@ jobs:
       build_jaxlib: ${{ 'true' }}
       build_jax: ${{ 'true' }}
       bazel_command: ${{ (contains(matrix.runner, 'linux-x86') && 'test') || 'build' }}
-      clone_main_xla: 1
+      clone_main_xla: 0

@@ -285,12 +285,6 @@ def TileTransformAttr : MosaicGPU_Attr<"TileTransform", "tile"> {
   let assemblyFormat = "`<` $tiling `>`";
 }
 
-def TransposeTransformAttr : MosaicGPU_Attr<"TransposeTransform", "transpose"> {
-  let parameters = (ins "::mlir::DenseI32ArrayAttr":$permutation);
-  let summary = "Specifies a transpose transform of a memref in SMEM.";
-  let assemblyFormat = "`<` $permutation `>`";
-}
-
 def SwizzleTransformAttr : MosaicGPU_Attr<"SwizzleTransform", "swizzle"> {
   let parameters = (ins "SwizzlingModeAttr":$swizzle);
 
@@ -582,6 +576,32 @@ def MosaicGPU_VectorStoreOp : Op<MosaicGPU_Dialect, "vector_store",
   let hasVerifier = 1;
 }
 
+def MosaicGPU_AsyncStoreSmemOp : Op<MosaicGPU_Dialect, "async_store_smem",
+      [MemoryEffects<[MemWrite]>]> {
+  let summary = "Issues an async store of a vector from registers to SMEM of a block in a cluster";
+  let description = [{
+    `cluster_dim` and `cluster_idx` specify the target block.
+
+    The target block can wait on the provided barrier (its local copy) to
+    observe the completion of this copy.
+
+    When `atomic` is specified, the store performs an atomic reduction on target
+    SMEM instead of overwriting it.
+  }];
+
+  let arguments = (ins
+    AnyFixedVectorOfNonZeroRank:$valueToStore,
+    AnyNon0RankedMemRef:$destination,
+    MemRefRankOf<[MosaicGPU_Barrier], [0]>:$barrier,
+    MosaicGPU_Dimension:$cluster_dim,
+    I32:$cluster_idx,
+    OptionalAttr<MosaicGPU_AtomicOpType>:$atomic_type,
+    OptionalAttr<BoolAttr>:$optimized
+  );
+
+  let hasVerifier = 1;
+}
+
 def MosaicGPU_WGMMASupportedType : AnyTypeOf<[F16, BF16, F32],
     "A type supported by the WGMMA operation">;
 
@@ -715,7 +735,10 @@ def MosaicGPU_WGMMAOp : Op<MosaicGPU_Dialect, "wgmma",
 
     The `accumulator` must be a vector with a FragmentedLayout. The WGMMA
     operation will be executed in the async proxy and any inputs in
-    registers need to be synchronized with a memory fence.
+    registers need to be synchronized with a memory fence. Note that the
+    caller is responsible for fencing the `accumulator` prior to issuing
+    the op, whereas `a` is fenced automatically in the lowering if it is
+    passed in registers.
 
     Usually `a` is read from shared memory if it is used directly in the WGMMA
     operation. If `a` needs to be transformed before it is used in the WGMMA
@@ -743,8 +766,44 @@ def MosaicGPU_WGMMAOp : Op<MosaicGPU_Dialect, "wgmma",
   let hasVerifier = 1;
 }
 
+def MosaicGPU_MMASupportedABType : AnyTypeOf<[F64, TF32, F16, BF16, F8E4M3FN, F8E5M2, I8, I<4>, I1],
+    "A type supported by the `a` and `b` operands of the synchronous `mma` op">;
+
+def MosaicGPU_MMASupportedAccumulatorType : AnyTypeOf<[F64, F32, F16, I32],
+    "A type supported by the accumulator of the synchronous `mma` op">;
+
+def MosaicGPU_MMAOp : Op<MosaicGPU_Dialect, "mma",
+    [DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Multiply two matrices using `mma.sync.aligned`.";
+  let description = [{
+    Computes `a @ b + accumulator` synchronously using Ampere MMA instructions.
+
+    The output has an identical shape and type as the input accumulator.
+  }];
+  let arguments = (ins
+    VectorOfRankAndType<[2], [MosaicGPU_MMASupportedAccumulatorType]>:$accumulator,
+    VectorOfRankAndType<[2], [MosaicGPU_MMASupportedABType]>:$a,
+    VectorOfRankAndType<[2], [MosaicGPU_MMASupportedABType]>:$b
+  );
+  let results = (outs VectorOfRankAndType<[2], [MosaicGPU_MMASupportedAccumulatorType]>);
+
+  let assemblyFormat = [{
+    `accumulator` `(` $accumulator `:` type($accumulator) `)`
+    `a` `(` $a `:` type($a) `)`
+    `b` `(` $b `:` type($b) `)`
+    attr-dict
+    `->` type(results)
+  }];
+
+  let hasVerifier = 1;
+}
+
 def MosaicGPU_TmemAttr : MosaicGPU_Attr<"Tmem", "tmem"> {
   let summary = "Tensor memory space.";
+}
+
+def MosaicGPU_SmemClusterAttr : MosaicGPU_Attr<"SmemCluster", "smem_cluster"> {
+  let summary = "Cluster shared memory space.";
 }
 
 def MosaicGPU_TcGen05MMASupportedABType : AnyTypeOf<[F16, F32, BF16, TF32, F8E4M3FN, F8E5M2, F6E2M3FN, F6E3M2FN, F4E2M1FN, I8],
@@ -1124,6 +1183,39 @@ def MosaicGPU_BroadcastedIotaOp : Op<MosaicGPU_Dialect, "broadcasted_iota", []> 
   let results = (outs AnyFixedVectorOfNonZeroRank);
 
   let hasVerifier = 1;
+}
+
+def MosaicGPU_GetClusterRefOp : Op<MosaicGPU_Dialect, "get_cluster_ref", [Pure, AttrSizedOperandSegments, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Maps a memref to a peer block in the cluster.";
+  let description = [{
+    Maps a memref to a peer block in the cluster along specified dimensions.
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$source,
+    Optional<I32>:$x,
+    Optional<I32>:$y,
+    Optional<I32>:$z
+  );
+
+  let results = (outs AnyMemRef:$result);
+}
+
+def MosaicGPU_AssumeMultipleOp : Op<MosaicGPU_Dialect, "assume_multiple", [Pure, SameOperandsAndResultType]> {
+  let summary = "Assumes that a value is a multiple of a given integer.";
+  let description = [{
+    This operation is a hint to the compiler that the input `value` is guaranteed
+    to be a multiple of `multiple`. This can be used to satisfy divisibility checks
+    in some compiler passes.
+
+    The result is the same as the input `value`.
+  }];
+  let arguments = (ins
+    AnyTypeOf<[Index, AnyInteger]>:$value,
+    ConfinedAttr<I32Attr, [IntPositive]>:$multiple
+  );
+  let results = (outs AnyTypeOf<[Index, AnyInteger]>:$result);
+  let assemblyFormat = [{$value `,` $multiple attr-dict `:` type($result)}];
 }
 
 #endif // THIRD_PARTY_PY_JAX_JAXLIB_MOSAIC_DIALECT_GPU_MOSAIC_GPU_TD_

@@ -68,6 +68,7 @@ WHEEL_BUILD_TARGET_DICT = {
     "jax-rocm-plugin": "//jaxlib/tools:jax_rocm_plugin_wheel",
     "jax-rocm-pjrt": "//jaxlib/tools:jax_rocm_pjrt_wheel",
     "mosaic-gpu-cuda": "//jaxlib/tools:mosaic_gpu_wheel_cuda{cuda_major_version}",
+    "jax-oneapi-plugin": "//jaxlib/tools:jax_oneapi_plugin_wheel",
     "jax-oneapi-pjrt": "//jaxlib/tools:jax_oneapi_pjrt_wheel",
 }
 
@@ -151,7 +152,7 @@ def add_artifact_subcommand_arguments(parser: argparse.ArgumentParser):
         --wheels="jaxlib,jax-cuda-plugin", etc.
         Valid options are: jaxlib, jax-cuda-plugin or cuda-plugin, jax-cuda-pjrt or cuda-pjrt,
         jax-rocm-plugin or rocm-plugin, jax-rocm-pjrt or rocm-pjrt,
-        jax-oneapi-pjrt or oneapi-pjrt.
+        jax-oneapi-pjrt or oneapi-pjrt, jax-oneapi-plugin or oneapi-plugin.
         """,
   )
 
@@ -514,7 +515,7 @@ async def main():
           " jax-cuda-plugin or cuda-plugin, jax-cuda-pjrt or cuda-pjrt,"
           " jax-rocm-plugin or rocm-plugin, jax-rocm-pjrt or rocm-pjrt,"
           " or mosaic-gpu",
-          " jax-oneapi-pjrt or oneapi-pjrt",
+          " jax-oneapi-plugin or oneapi-plugin, jax-oneapi-pjrt or oneapi-pjrt",
           wheel,
       )
       sys.exit(1)
@@ -534,6 +535,7 @@ async def main():
   if args.local_xla_path:
     logging.debug("Local XLA path: %s", args.local_xla_path)
     wheel_build_command_base.append(f"--override_repository=xla=\"{args.local_xla_path}\"")
+    wheel_build_command_base.append(f"--override_module=xla=\"{args.local_xla_path}\"")
 
   if args.target_cpu:
     logging.debug("Target CPU: %s", args.target_cpu)
@@ -666,7 +668,6 @@ async def main():
       )
 
   if "rocm" in args.wheels:
-    wheel_build_command_base.append("--config=rocm_base")
     wheel_build_command_base.append("--config=rocm")
     if clang_local:
       wheel_build_command_base.append(f"--action_env=CLANG_COMPILER_PATH=\"{clang_path}\"")

@@ -360,6 +360,29 @@ llvm::LogicalResult AsyncStoreOp::verify() {
                                  getSliceLengths(), getIndices());
 }
 
+llvm::LogicalResult AsyncStoreSmemOp::verify() {
+  mlir::VectorType value_type = getValueToStore().getType();
+  mlir::MemRefType dest_type = getDestination().getType();
+
+  if (value_type.getShape() != dest_type.getShape()) {
+    return emitOpError(
+        "The `valueToStore` and `destination` must have the same shape.");
+  }
+  if (value_type.getElementType() != dest_type.getElementType()) {
+    return emitOpError(
+        "The `valueToStore` and `destination` must have the same element "
+        "type.");
+  }
+
+  mlir::Attribute smem = mlir::gpu::AddressSpaceAttr::get(
+      getContext(), mlir::gpu::AddressSpace::Workgroup);
+  if (dest_type.getMemorySpace() != smem) {
+    return emitOpError("The `destination` memref must be in SMEM.");
+  }
+
+  return llvm::success();
+}
+
 llvm::LogicalResult TryClusterCancelOp::verify() {
   auto result_ty = getCancellationResult().getType();
   if (result_ty.getNumElements() != 16) {
@@ -448,6 +471,74 @@ llvm::LogicalResult WGMMAOp::verify() {
         "The accumulator's first dimension must be a multiple of {0}, but got "
         "{1}.",
         kWgmmaSizeM, M);
+  }
+
+  return llvm::success();
+}
+
+llvm::LogicalResult MMAOp::inferReturnTypes(
+    mlir::MLIRContext*, std::optional<mlir::Location> location,
+    mlir::ValueRange operands, mlir::DictionaryAttr attributes,
+    mlir::PropertyRef properties, mlir::RegionRange regions,
+    llvm::SmallVectorImpl<mlir::Type>& inferredReturnTypes) {
+  if (operands.empty()) {
+    return mlir::emitOptionalError(location, "expected non-empty operands");
+  }
+  inferredReturnTypes.assign({operands[0].getType()});
+  return mlir::success();
+}
+
+llvm::LogicalResult MMAOp::verify() {
+  auto error = [this](auto... params) {
+    return emitOpError(llvm::formatv(params...));
+  };
+
+  auto a_type = getA().getType();
+  auto b_type = getB().getType();
+  auto acc_type = getAccumulator().getType();
+
+  if (a_type.getElementType() != b_type.getElementType()) {
+    return error("The `a` and `b` inputs must have the same element type.");
+  }
+
+  auto a_shape = a_type.getShape();
+  auto b_shape = b_type.getShape();
+  auto acc_shape = acc_type.getShape();
+
+  int M = acc_shape[0];
+  if (M != a_shape[0]) {
+    return error(
+        "The accumulator's first dimension {0} must be equal to the first "
+        "dimension of `a`: {1}.",
+        M, a_shape[0]);
+  }
+  int K = a_shape[1];
+  if (K != b_shape[0]) {
+    return error(
+        "`a`'s second dimension {0} must be equal to `b`'s first dimension: "
+        "{1}.",
+        K, b_shape[0]);
+  }
+  int N = acc_shape[1];
+  if (N != b_shape[1]) {
+    return error(
+        "The accumulator's second dimension {0} must be equal to the second "
+        "dimension of `b`: {1}.",
+        N, b_shape[1]);
+  }
+
+  auto element_type = a_type.getElementType();
+  auto acc_element_type = acc_type.getElementType();
+  if (mlir::isa<mlir::IntegerType>(element_type)) {
+    if (!acc_element_type.isInteger(32)) {
+      return error("Only i32 accumulator supported for integer operands.");
+    }
+  } else if (mlir::isa<mlir::FloatType>(element_type)) {
+    if (!mlir::isa<mlir::FloatType>(acc_element_type)) {
+      return error("Only float accumulator supported for floating operands.");
+    }
+  } else {
+    return error("Unsupported operand type.");
   }
 
   return llvm::success();
@@ -597,6 +688,7 @@ llvm::LogicalResult CustomPrimitiveOp::verify() {
         "Custom primitive must have a layout for each vector operand.");
   }
 
+  // TODO(bchetioui): Don't require transforms for barrier memrefs.
   if (num_smem_ref_operands != getInTransforms().size()) {
     return emitOpError(
         "Custom primitive must have transforms for each memref operand in "
@@ -1158,25 +1250,35 @@ struct HoistReinterpretCastOutOfWarpMap
   mlir::LogicalResult matchAndRewrite(
       WarpMapOp op, mlir::PatternRewriter& rewriter) const override {
     bool modified = false;
-    mlir::Block& body = op->getRegion(0).getBlocks().front();
+    mlir::Block& body = op.getRegion().front();
     for (auto [i, operand, body_operand] :
         llvm::enumerate(op->getOperands(), body.getArguments())) {
-      // It is not safe to rewrite the type of the argument if it has other
-      // uses, as this would affect other operations that we currently do not
-      // handle.
-      if (body_operand.hasOneUse()) {
-        mlir::Operation* user = *body_operand.user_begin();
-        if (auto rc_op = llvm::dyn_cast<ReinterpretCastOp>(user)) {
-          mlir::IRMapping mapping;
-          mapping.map(rc_op.getOperand(), operand);
-          rewriter.modifyOpInPlace(op, [&]() {
-            op->setOperand(i, rewriter.clone(*rc_op, mapping)->getResult(0));
-            body_operand.setType(rc_op.getType());
-          });
-          rewriter.replaceAllUsesWith(rc_op, body_operand);
-          rewriter.eraseOp(rc_op);
-          modified = true;
+      Type user_type = nullptr;
+      // It is only safe to rewrite the type of the argument if all of its uses
+      // are reinterpret_cast operations producing the same return type.
+      if (body_operand.hasNUsesOrMore(1) &&
+          absl::c_all_of(
+              body_operand.getUsers(), [&user_type](mlir::Operation* user) {
+                if (auto rc_op = llvm::dyn_cast<ReinterpretCastOp>(user)) {
+                  if (!user_type) {
+                    user_type = rc_op.getType();
+                  }
+                  return rc_op.getType() == user_type;
+                }
+                return false;
+              })) {
+        auto new_cast = ReinterpretCastOp::create(rewriter, op.getLoc(),
+                                                  user_type, operand);
+        rewriter.modifyOpInPlace(op, [&]() {
+          op->setOperand(i, new_cast);
+          body_operand.setType(user_type);
+        });
+        // Copy the users of the body operand to a vector to avoid invalidating
+        // the iterator while erasing them.
+        for (auto user : llvm::to_vector(body_operand.getUsers())) {
+          rewriter.replaceOp(user, body_operand);
         }
+        modified = true;
       }
     }
     return modified ? mlir::success() : mlir::failure();
@@ -1187,6 +1289,22 @@ struct HoistReinterpretCastOutOfWarpMap
 void WarpMapOp::getCanonicalizationPatterns(mlir::RewritePatternSet& patterns,
                                             mlir::MLIRContext* context) {
   patterns.add<HoistReinterpretCastOutOfWarpMap>(context);
+}
+
+llvm::LogicalResult GetClusterRefOp::inferReturnTypes(
+    mlir::MLIRContext* context, std::optional<mlir::Location> location,
+    mlir::ValueRange operands, mlir::DictionaryAttr attributes,
+    mlir::PropertyRef properties, mlir::RegionRange regions,
+    llvm::SmallVectorImpl<mlir::Type>& inferredReturnTypes) {
+  if (operands.empty()) {
+    return mlir::emitOptionalError(location, "expected non-empty operands");
+  }
+  auto memref_type = mlir::cast<mlir::MemRefType>(operands[0].getType());
+  auto result_type = mlir::MemRefType::get(
+      memref_type.getShape(), memref_type.getElementType(),
+      memref_type.getLayout(), SmemClusterAttr::get(context));
+  inferredReturnTypes.assign({result_type});
+  return mlir::success();
 }
 
 void MosaicGPUDialect::initialize() {

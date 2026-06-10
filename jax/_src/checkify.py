@@ -100,7 +100,7 @@ class JaxException(Exception):
 
 
 @functools.total_ordering
-@dataclasses.dataclass(eq=True, frozen=True)
+@dataclasses.dataclass(eq=True, frozen=True, slots=True)
 class ErrorEffect(effects.Effect):
   error_type: type[JaxException]
   shape_dtypes: tuple[api.ShapeDtypeStruct, ...]
@@ -193,7 +193,7 @@ class FailedCheckError(JaxException):
     vals = jtu.tree_leaves((self.args, self.kwargs))
     return ErrorEffect(
         FailedCheckError,
-        tuple(api.ShapeDtypeStruct(x.shape, x.dtype) for x in vals))
+        tuple(api.ShapeDtypeStruct.like(x) for x in vals))
 
 @dataclasses.dataclass
 class BatchedError(JaxException):
@@ -212,7 +212,7 @@ class BatchedError(JaxException):
 # Error Value
 
 @jtu.register_pytree_node_class
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Error:
   _pred: dict[ErrorEffect, Bool]
   _code: dict[ErrorEffect, Int]
@@ -408,8 +408,9 @@ def checkify_jaxpr_flat(jaxpr: core.Jaxpr, consts: Sequence[core.Value],
     checkify_rule = error_checks.get(
         eqn.primitive, functools.partial(default_checkify_rule, eqn.primitive))
     name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
-    with source_info_util.user_context(eqn.source_info.traceback,
-                                       name_stack=name_stack):
+    with (source_info_util.user_context(eqn.source_info.traceback,
+                                        name_stack=name_stack),
+          eqn.ctx.manager):
       error, outvals = checkify_rule(error, enabled_errors,
                                      *invals, **eqn.params)
     if eqn.primitive.multiple_results:
@@ -535,7 +536,7 @@ mlir.register_lowering(check_p, check_lowering_rule,
 
 def check_batching_rule(batched_args, batch_dims, *, err_tree, debug):
   size = next(x.shape[dim] for x, dim in zip(batched_args, batch_dims)
-              if dim is not batching.not_mapped)
+              if dim is not None)
   batched_args = (batching.bdim_at_front(a, d, size)
                   for a, d in zip(batched_args, batch_dims))
   err = tree_unflatten(err_tree, batched_args)
@@ -961,7 +962,7 @@ def shard_map_error_check(
   new_in_specs = (*([P()] * num_error_vals), *in_specs)
   new_vals_in = [*err_vals, *vals_in]
   in_avals = list(map(core.typeof, new_vals_in))
-  manual_axes = kwargs.get('manual_axes')
+  manual_axes = kwargs.get('newly_manual_axes')
   check_vma = kwargs.get('check_vma')
   for i, v in enumerate(in_avals):
     if not (sharder := core.shard_aval_handlers.get(type(v))):

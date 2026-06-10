@@ -38,10 +38,12 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith as arith_dialect
 from jax._src.lib.mlir.dialects import builtin as builtin_dialect
 from jax._src.lib.mlir.dialects import gpu as gpu_dialect
+from jax._src.lib.mlir.dialects import llvm as llvm_dialect
 from jax._src.lib.mlir.dialects import nvvm as nvvm_dialect
 from jax._src.lib.mlir.dialects import vector as vector_dialect
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas import primitives as pallas_primitives
+from jax._src.pallas import utils as pallas_utils
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
 from jax._src.pallas.mosaic_gpu.core import state_types
@@ -171,7 +173,7 @@ def _copy_smem_to_gmem_pp_eqn(
     pp_params["commit_group"] = commit_group
   if eqn.params["has_user_predicate"]:
     flat_args, user_predicate = flat_args[:-1], flat_args[-1]
-    pp_params["user_predicate"] = jax_core.pp_var(user_predicate, context)
+    pp_params["user_predicate"] = user_predicate.pretty_print(context)
   if reduction_op := eqn.params["reduction_op"]:
     pp_params["reduction_op"] = reduction_op
   flat_src_transforms, flat_dst_transforms = util.split_list(
@@ -220,15 +222,6 @@ def _copy_smem_to_gmem_lowering(
   else:
     predicate = None
 
-  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-    if predicate is not None:
-      assert ctx.module_ctx.single_lane_predicate is not None
-      predicate = arith_dialect.andi(
-          predicate, ctx.module_ctx.single_lane_predicate
-      )
-    else:
-      predicate = ctx.module_ctx.single_lane_predicate
-
   flat_src_transforms, flat_dst_transforms = util.split_list(
       flat_args,
       [src_transforms_treedef.num_leaves],
@@ -259,15 +252,35 @@ def _copy_smem_to_gmem_lowering(
       **_extract_gmem_copy_params(ctx, dst_transforms, dst_transform_avals, supports_multicast=True),
       **_extract_smem_copy_params(src_aval, src_transforms),
   }
+  is_scatter = False
+  if gmem_slice := copy_params.get("gmem_slice", ()):
+    first_idx = gmem_slice[0]
+    if isinstance(first_idx, mgpu.FragmentedArray) and first_idx.shape:
+      is_scatter = True
+
+  if is_scatter:
+    if predicate is not None:
+      raise NotImplementedError("Gather/scatter TMA does not support predicates yet.")
+    if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+      raise ValueError("Gather/scatter operations are not supported in a warp context.")
+
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    if not is_scatter:
+      lane_pred = ctx.module_ctx.single_lane_predicate
+      assert lane_pred is not None  # Satisfy pytype
+      if predicate is not None:
+        predicate = arith_dialect.andi(predicate, lane_pred)
+      else:
+        predicate = lane_pred
+
     ctx.launch_ctx.async_copy(
         src_ref=src,
         dst_ref=dst,
-        predicate=predicate,
         arrive=commit_group,
         reduction_op=reduction_op,
         oob_mode=OOBFillMode.UNDEFINED,
         **copy_params,
+        **(dict(predicate=predicate) if predicate is not None else {}),  # pyrefly: ignore[bad-argument-type]
     )
     return ()
 
@@ -292,16 +305,6 @@ def _copy_smem_to_gmem_lowering(
   else:
     reduction_op_attr = None
 
-  # TODO(olechwierowicz): Remove this once min jaxlib version is 0.10.1
-  if hasattr(mgpu.dialect.AsyncStoreOp, "gmem_peer_id") and hasattr(
-      mgpu.dialect.AsyncStoreOp, "is_global_broadcast"
-  ):
-    kwargs = {
-        "gmem_peer_id": peer_id,
-        "is_global_broadcast": is_global_broadcast,
-    }
-  else:
-    kwargs = {}
   mgpu.dialect.async_store(
       src,
       dst,
@@ -310,7 +313,8 @@ def _copy_smem_to_gmem_lowering(
       predicate=predicate,
       commit_group=commit_group,
       reduction_op=reduction_op_attr,
-      **kwargs  # pyrefly: ignore[bad-argument-type]
+      gmem_peer_id=peer_id,
+      is_global_broadcast=is_global_broadcast,
   )
   return ()
 
@@ -467,6 +471,213 @@ def copy_smem_to_gmem(
   return None
 
 
+async_store_smem_p = jax_core.Primitive("async_store_smem")
+async_store_smem_p.multiple_results = True
+
+
+@async_store_smem_p.def_effectful_abstract_eval
+def _async_store_smem_abstract_eval(
+    src,
+    ref,
+    barrier,
+    cluster_idx,
+    *flat_transforms_avals,
+    ref_transforms_treedef,
+    barrier_transforms_treedef,
+    **_,
+):
+  del cluster_idx  # Unused.
+  _check_ref(ref, "ref", gpu_core.SMEM)
+  _check_ref(barrier, "barrier", gpu_core.SMEM)
+  flat_ref_transforms_avals, flat_barrier_transforms_avals = util.split_list(
+      flat_transforms_avals,
+      [ref_transforms_treedef.num_leaves],
+  )
+  ref_transform_avals = ref_transforms_treedef.unflatten(
+      flat_ref_transforms_avals
+  )
+  barrier_transform_avals = barrier_transforms_treedef.unflatten(
+      flat_barrier_transforms_avals
+  )
+  transformed_ref = pallas_core.TransformedRef(ref, ref_transform_avals)
+  if src.shape != transformed_ref.shape:
+    raise TypeError(
+        f"The stored value has shape {src.shape}, but the target reference has"
+        f" shape {transformed_ref.shape}"
+    )
+  if src.dtype != transformed_ref.dtype:
+    raise TypeError(
+        f"The stored value has dtype {src.dtype}, but the target reference has"
+        f" dtype {transformed_ref.dtype}"
+    )
+  transformed_barrier = pallas_core.TransformedRef(barrier, barrier_transform_avals)
+  if transformed_barrier.size != 1:
+    raise TypeError(
+        "Expected a single barrier, got a barrier reference with shape"
+        f" {transformed_barrier.shape}"
+    )
+
+  effs = {gpu_core._memory_effect, state.WriteEffect(1)}
+  return (), effs
+
+
+@lowering.register_lowering_rule(async_store_smem_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(async_store_smem_p, mgpu.LoweringSemantics.Warpgroup)
+def _async_store_smem_lowering(
+    ctx: lowering.LoweringRuleContext,
+    src,
+    ref,
+    barrier,
+    cluster_idx,
+    *flat_transforms,
+    ref_transforms_treedef,
+    barrier_transforms_treedef,
+    cluster_dim,
+    optimized,
+    atomic,
+):
+  flat_ref_transforms, flat_barrier_transforms = util.split_list(
+      flat_transforms,
+      [ref_transforms_treedef.num_leaves],
+  )
+  flat_ref_transforms_avals, _ = util.split_list(
+      ctx.avals_in[4:],
+      [ref_transforms_treedef.num_leaves],
+  )
+
+  ref_transform_avals = ref_transforms_treedef.unflatten(
+      flat_ref_transforms_avals
+  )
+  ref_aval = ctx.avals_in[1]
+  barrier_ref_aval = ctx.avals_in[2]
+  assert isinstance(ref_aval, state_types.AbstractRef)
+  assert isinstance(barrier_ref_aval, state_types.AbstractRef)
+
+  ref_transforms = ref_transforms_treedef.unflatten(flat_ref_transforms)
+  barrier_transforms = barrier_transforms_treedef.unflatten(flat_barrier_transforms)
+
+  ref_smem, _, remaining_ref_transforms = lowering._handle_transforms(
+      ctx,
+      ref_aval,
+      ref,
+      ref_transform_avals,
+      ref_transforms,
+      handle_transposes=True,
+  )
+
+  base_index = _get_barrier_base_index(barrier_ref_aval, barrier_transforms)
+  if base_index is not None:
+    barrier = barrier[base_index]
+
+  cluster_idx_val = lowering._as_index(cluster_idx)
+  gpu_cluster_dim = lowering._resolve_cluster_axis(ctx.module_ctx.axis_names, cluster_dim)
+
+  shape = ctx.avals_in[0].shape
+  dtype = ctx.avals_in[0].dtype
+  if not shape:
+    raise NotImplementedError("Scalars are not supported in async_store_smem")
+
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
+    if remaining_ref_transforms:
+      raise ValueError(f"Unexpected unhandled transforms: {remaining_ref_transforms}")
+    assert isinstance(barrier, mgpu.DialectBarrierRef)
+    cluster_idx_i32 = arith_dialect.index_cast(
+        ir.IntegerType.get_signless(32), cluster_idx_val
+    )
+    atomic_type = None
+    if atomic is not None:
+      atomic_type = _atomic_op_type_to_int(AtomicOpType(atomic))
+    mgpu.dialect.async_store_smem(
+        src,
+        ref_smem,
+        barrier.as_barrier_memref(),
+        gpu_cluster_dim.value,
+        cluster_idx_i32,
+        atomic_type=atomic_type,
+        optimized=optimized,
+    )
+    return ()
+
+  match remaining_ref_transforms:
+    case (gpu_core.UnswizzleRef(swizzle), gpu_core.UntilingTransform(tiling)):
+      pass
+    case _:
+      raise NotImplementedError("async_store_smem requires a tiled and swizzled ref")
+
+  total_bits = math.prod(shape) * dtypes.itemsize_bits(dtype)
+  if total_bits % 8:
+    raise ValueError(
+        f"Can only transfer integer bytes (shape={shape}, dtype={dtype})"
+    )
+  total_bytes = total_bits // 8
+  if total_bytes % WARPGROUP_SIZE:
+    raise NotImplementedError(f"Transfer is not a multiple of {WARPGROUP_SIZE} bytes")
+
+  peer_barrier = barrier.remap_to_cluster(gpu_cluster_dim, cluster_idx_val)
+  peer_barrier.arrive_expect_tx(total_bytes // WARPGROUP_SIZE)
+
+  lowering._ensure_fa(src, dtype).store_tiled_async(
+      ref_smem,
+      barrier,
+      cluster_dim=gpu_cluster_dim,
+      cluster_idx=cluster_idx_val,
+      swizzle=swizzle,
+      optimized=optimized,
+      tiling_rank=len(tiling),
+      atomic=atomic,
+  )
+  return ()
+
+
+def async_store_smem(
+    src: jax.Array,
+    ref: _Ref,
+    barrier: _Ref,
+    *,
+    cluster_idx: jax.Array,
+    cluster_dim: Hashable | int,
+    optimized: bool = True,
+    atomic: Literal["add", "max", "min", "and", "or", "xor"] | None = None,
+) -> None:
+  """Asynchronously stores an array to a SMEM reference within the cluster.
+
+  Args:
+    src: The array containing the data to be stored.
+    ref: The SMEM reference to store to.
+    barrier: The barrier to update when the copy has completed (in destination block).
+    cluster_idx: The index of the target cluster block within cluster_dim.
+    cluster_dim: The cluster axis of cluster_idx.
+    optimized: If True, the store is guaranteed not to cause any bank conflicts.
+    atomic: The reduction operation to apply instead of overwriting the data.
+  """
+  ref, ref_transforms = state_primitives.get_ref_and_transforms(
+      ref, None, "async_store_smem"
+  )
+  barrier, barrier_transforms = state_primitives.get_ref_and_transforms(
+      barrier, None, "async_store_smem"
+  )
+  flat_ref_transforms, ref_transforms_treedef = tree_util.tree_flatten(
+      ref_transforms
+  )
+  flat_barrier_transforms, barrier_transforms_treedef = tree_util.tree_flatten(
+      barrier_transforms
+  )
+  async_store_smem_p.bind(
+      src,
+      ref,
+      barrier,
+      cluster_idx,
+      *flat_ref_transforms,
+      *flat_barrier_transforms,
+      ref_transforms_treedef=ref_transforms_treedef,
+      barrier_transforms_treedef=barrier_transforms_treedef,
+      cluster_dim=cluster_dim,
+      optimized=optimized,
+      atomic=atomic,
+  )
+  return None
+
+
 copy_gmem_to_smem_p = jax_core.Primitive("copy_gmem_to_smem")
 copy_gmem_to_smem_p.multiple_results = True
 
@@ -589,8 +800,9 @@ def _copy_gmem_to_smem_lowering(
       **_extract_smem_copy_params(dst_ref_aval, dst_transforms),
       **_extract_gmem_copy_params(ctx, src_transforms, src_transform_avals),
   }
-  base_index = _extract_barrier_slice_base(
-      barrier_transforms_treedef.unflatten(flat_barrier_transforms)
+  base_index = _get_barrier_base_index(
+      barrier_ref_aval,
+      barrier_transforms_treedef.unflatten(flat_barrier_transforms),
   )
   if base_index is not None:
     barrier = barrier[base_index]
@@ -935,31 +1147,43 @@ def async_prefetch(
   return None
 
 
-def _extract_barrier_slice_base(transforms) -> ir.Value | None:
+def _get_barrier_base_index(aval, transforms) -> ir.Value | None:
   if not transforms:
     return None
+  strides = list(pallas_utils.strides_from_shape(aval.shape))
   base_index: ir.Value | None = None
   while transforms:
     match transforms:
-      case [indexing.NDIndexer(indices=[idx]) as indexer, *transforms]:
-        if isinstance(idx, indexing.Slice):
-          if indexing.Slice.from_slice(slice(None), *indexer.shape) == idx:
-            # Special-case: the whole slice.
-            continue
-          idx = idx.start
-        if isinstance(
-            idx, (int, ir.Value, mgpu.FragmentedArray, literals.TypedNdArray)
-        ):
-          if base_index is None:
-            base_index = lowering._as_index(idx)
+      case [indexing.NDIndexer() as indexer, *transforms]:
+        num_int_idxs = 0
+        for i, (idx, stride) in enumerate(zip(indexer.indices, strides[:])):
+          if isinstance(idx, indexing.Slice):
+            if idx.stride != 1:
+              raise NotImplementedError(
+                  "Barrier does not support slice with `stride != 1`"
+              )
+            idx = idx.start
           else:
-            base_index = arith_dialect.addi(base_index, lowering._as_index(idx))
-        else:
-          raise ValueError(
-              f"Barrier can only be indexed with integers or slices, got {idx}"
-          )
-      case [indexing.NDIndexer(), *_]:
-        raise NotImplementedError("Barrier does not support multiple indices")
+            # This dimension is absent for any corresponding `NDIndexer`s, so
+            # we remove the corresponding stride.
+            strides.pop(i - num_int_idxs)
+            num_int_idxs += 1
+
+          if isinstance(
+              idx, (int, ir.Value, mgpu.FragmentedArray, literals.TypedNdArray)
+          ):
+            idx = lowering._as_index(idx)  # pylint: disable=protected-access
+          else:
+            raise ValueError(
+                "Barrier can only be indexed with integers or slices, got"
+                f" {idx}"
+            )
+
+          idx = arith_dialect.muli(idx, lowering._as_index(stride))  # pylint: disable=protected-access
+          if base_index is None:
+            base_index = idx
+          else:
+            base_index = arith_dialect.addi(base_index, idx)
       case _:
         raise ValueError("Barrier does not support arbitrary transforms")
   return base_index
@@ -1008,7 +1232,7 @@ def _barrier_arrive_lowering(
   transforms = transforms_treedef.unflatten(flat_transforms)
   barrier_aval = ctx.avals_in[0]
   assert isinstance(barrier_aval, state_types.AbstractRef)
-  base_index = _extract_barrier_slice_base(transforms)
+  base_index = _get_barrier_base_index(barrier_aval, transforms)
   if base_index is not None:
     barrier = barrier[base_index]
   sem_dtype = barrier_aval.inner_aval.dtype  # pyrefly: ignore[missing-attribute]
@@ -1084,11 +1308,7 @@ def _barrier_test_pp_eqn(
 jax_core.pp_eqn_rules[barrier_test_p] = _barrier_test_pp_eqn
 
 
-@lowering.register_lowering_rule(barrier_test_p, mgpu.LoweringSemantics.Lane)
 @lowering.register_lowering_rule(barrier_test_p, *gpu_core.LANExWARP_SEMANTICS)
-@lowering.register_lowering_rule(
-    barrier_test_p, mgpu.LoweringSemantics.Warpgroup
-)
 @lowering.register_lowering_rule(barrier_test_p, *gpu_core.WGxWARP_SEMANTICS)
 def _barrier_test_lowering(
     ctx: lowering.LoweringRuleContext,
@@ -1102,9 +1322,12 @@ def _barrier_test_lowering(
   orders_tensor_core = getattr(
       barrier_aval.inner_aval.dtype, "orders_tensor_core", False  # pyrefly: ignore[missing-attribute]
   )
-  base_index = _extract_barrier_slice_base(transforms)
+  base_index = _get_barrier_base_index(barrier_aval, transforms)
   if base_index is not None:
     barrier = barrier[base_index]
+  # Ensure that all threads in the warp have converged and will not read
+  # different values from the barrier.
+  mgpu.utils.warp_barrier()
   wait_complete = barrier.test(orders_tensor_core=orders_tensor_core)
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
     return wait_complete
@@ -1116,6 +1339,8 @@ def barrier_test(barrier: state.AbstractRef) -> jax.Array:
 
   This is a non-blocking equivalent of `barrier_wait`, which returns a boolean
   indicating whether or not the current barrier phase is complete.
+
+  `barrier_test` is only supported within a warp context.
   """
   barrier, transforms = state_primitives.get_ref_and_transforms(
       barrier, None, "barrier_test"
@@ -1174,7 +1399,7 @@ def _barrier_wait_lowering(
   orders_tensor_core = getattr(
       barrier_aval.inner_aval.dtype, "orders_tensor_core", False  # pyrefly: ignore[missing-attribute]
   )
-  base_index = _extract_barrier_slice_base(transforms)
+  base_index = _get_barrier_base_index(barrier_aval, transforms)
   if base_index is not None:
     barrier = barrier[base_index]
   barrier.wait(orders_tensor_core=orders_tensor_core)
@@ -1468,7 +1693,7 @@ def _wgmma_lowering(
   b_transform_avals = transform_treedefs[2].unflatten(transform_avals_list[2])
   b, _, b_transforms = lowering._handle_transforms(
       ctx, b_ref_aval, b, b_transform_avals, b_transforms,
-      handle_transposes=False, handle_reshapes=False)
+      handle_transposes=False)
 
   match b_transforms:
     case (gpu_core.UnswizzleRef(rhs_swizzle), gpu_core.UntilingTransform(rhs_tiling)):
@@ -1479,25 +1704,6 @@ def _wgmma_lowering(
         state_types.TransposeTransform((1, 0)),
     ):
       rhs_transpose = True
-    case (
-        gpu_core.UnswizzleRef(rhs_swizzle),
-        state_types.TransposeTransform((1, 0, 2, 3, 4)),
-        gpu_core.UntilingTransform(rhs_tiling),
-        state_types.TransposeTransform(permutation=(1, 0, 2)),
-        state.types.ReshapeTransform(shape=new_shape),
-    ):
-      if len(rhs_tiling) != 2 or len(new_shape) != 2:
-        raise ValueError("WGMMA expects shapes 2D tiled into 2D tiles.")
-
-      if any(d % t != 0 for d, t in util.safe_zip(new_shape, rhs_tiling)):
-        raise ValueError(
-            f"The last reshape {new_shape} is not divisible by the tiling"
-            f" {rhs_tiling}."
-        )
-
-      high_dims = [d // t for d, t in util.safe_zip(new_shape, rhs_tiling)]
-      b = mgpu.memref_reshape(b, (*high_dims, *rhs_tiling))
-      rhs_transpose = False
     case _:
       raise ValueError(f"WGMMA rhs has unsupported transforms: {b_transforms}.")
 
@@ -2027,9 +2233,10 @@ def _tcgen05_mma_lowering(
   avals = list(ctx.avals_in[4:])
   if arrive:
     barrier_ref, leaves = leaves[0], leaves[1:]
-    _barrier_ref_aval, avals = avals[0], avals[1:]
+    barrier_ref_aval, avals = avals[0], avals[1:]
   else:
     barrier_ref = None
+    barrier_ref_aval = None
   if scaled:
     a_scale_ref, b_scale_ref, leaves = leaves[0], leaves[1], leaves[2:]
     a_scale_ref_aval, b_scale_ref_aval, avals = avals[0], avals[1], avals[2:]
@@ -2156,7 +2363,7 @@ def _tcgen05_mma_lowering(
     barrier_transforms = barrier_transforms_tree.unflatten(
         barrier_transforms_leaves
     )
-    base_index = _extract_barrier_slice_base(barrier_transforms)
+    base_index = _get_barrier_base_index(barrier_ref_aval, barrier_transforms)
     if base_index is not None:
       barrier_ref = barrier_ref[base_index]
 
@@ -2238,17 +2445,17 @@ def _tcgen05_mma_lowering(
 
   with mgpu.when(predicate):
     tcgen05.mma(
-              acc,
-              a_ref,
-              b_ref,
-              a_swizzle=int(lhs_swizzle),
-              b_swizzle=int(rhs_swizzle),
-              a_scale=a_scale_ref,  # pyrefly: ignore[bad-argument-type]
-              b_scale=b_scale_ref,  # pyrefly: ignore[bad-argument-type]
-              a_sparse_metadata=a_sparse_metadata_ref,
-              accumulate=accumulate,
-              collective=collective,
-          )
+        acc,
+        a_ref,
+        b_ref,
+        a_swizzle=int(lhs_swizzle),
+        b_swizzle=int(rhs_swizzle),
+        a_scale=a_scale_ref,
+        b_scale=b_scale_ref,
+        a_sparse_metadata=a_sparse_metadata_ref,
+        accumulate=accumulate,
+        collective=collective,
+    )
     if arrive:
       assert barrier_ref is not None
       tcgen05.commit_arrive(barrier_ref,
@@ -2294,9 +2501,10 @@ def _tcgen05_mma_lowering_wg(
   avals = list(ctx.avals_in[4:])
   if arrive:
     barrier_ref, leaves = leaves[0], leaves[1:]
-    _barrier_ref_aval, avals = avals[0], avals[1:]
+    barrier_ref_aval, avals = avals[0], avals[1:]
   else:
     barrier_ref = None
+    barrier_ref_aval = None
 
   if scaled:
     # Scales are not supported for WG semantics, but we still need to unpack them
@@ -2397,7 +2605,7 @@ def _tcgen05_mma_lowering_wg(
     barrier_transforms = barrier_transforms_tree.unflatten(
         barrier_transforms_leaves
     )
-    base_index = _extract_barrier_slice_base(barrier_transforms)
+    base_index = _get_barrier_base_index(barrier_ref_aval, barrier_transforms)
     if base_index is not None:
       barrier_ref = barrier_ref[base_index]
 
@@ -2511,7 +2719,7 @@ def _tcgen05_commit_arrive_lowering(
     barrier_transforms = barrier_transforms_tree.unflatten(
         barrier_transforms_leaves
     )
-    base_index = _extract_barrier_slice_base(barrier_transforms)
+    base_index = _get_barrier_base_index(barrier_ref_aval, barrier_transforms)
     if base_index is not None:
       barrier_ref = barrier_ref[base_index]
 
@@ -2550,7 +2758,7 @@ def _tcgen05_commit_arrive_lowering_wg(
     barrier_transforms = barrier_transforms_tree.unflatten(
         barrier_transforms_leaves
     )
-    base_index = _extract_barrier_slice_base(barrier_transforms)
+    base_index = _get_barrier_base_index(barrier_ref_aval, barrier_transforms)
     if base_index is not None:
       barrier_ref = barrier_ref[base_index]
 
@@ -2646,7 +2854,7 @@ def _set_max_registers_lowering(
 
 
 def set_max_registers(n: int, *, action: Literal["increase", "decrease"]):
-  """Sets the maximum number of registers owned by a warp."""
+  """Sets the maximum number of per-lane registers in the thread."""
   set_max_registers_p.bind(n, action=action)
 
 
@@ -2706,6 +2914,68 @@ class ShapeDtypeStruct:
   shape: tuple[int, ...]
   dtype: jnp.dtype
   layout: SomeLayout
+
+
+griddepcontrol_wait_p = jax_core.Primitive("griddepcontrol_wait")
+griddepcontrol_wait_p.multiple_results = True
+
+
+@griddepcontrol_wait_p.def_effectful_abstract_eval
+def _griddepcontrol_wait_abstract_eval():
+  return (), {gpu_core._memory_effect}
+
+
+@lowering.register_lowering_rule(
+    griddepcontrol_wait_p, mgpu.LoweringSemantics.Lane
+)
+@lowering.register_lowering_rule(
+    griddepcontrol_wait_p, mgpu.LoweringSemantics.Warpgroup
+)
+def _griddepcontrol_wait_lowering(ctx: lowering.LoweringRuleContext):
+  void = ir.Type.parse("!llvm.void")
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, []):
+    llvm_dialect.inline_asm(
+        void, [], "griddepcontrol.wait;", "", has_side_effects=True
+    )
+  return ()
+
+
+def griddepcontrol_wait():
+  """Wait for dependent grids to finish."""
+  griddepcontrol_wait_p.bind()
+
+
+griddepcontrol_launch_dependents_p = jax_core.Primitive(
+    "griddepcontrol_launch_dependents"
+)
+griddepcontrol_launch_dependents_p.multiple_results = True
+
+
+@griddepcontrol_launch_dependents_p.def_effectful_abstract_eval
+def _griddepcontrol_launch_dependents_abstract_eval():
+  return (), {gpu_core._memory_effect}
+
+
+@lowering.register_lowering_rule(
+    griddepcontrol_launch_dependents_p, mgpu.LoweringSemantics.Lane
+)
+@lowering.register_lowering_rule(
+    griddepcontrol_launch_dependents_p, mgpu.LoweringSemantics.Warpgroup
+)
+def _griddepcontrol_launch_dependents_lowering(
+    ctx: lowering.LoweringRuleContext,
+):
+  void = ir.Type.parse("!llvm.void")
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, []):
+    llvm_dialect.inline_asm(
+        void, [], "griddepcontrol.launch_dependents;", "", has_side_effects=True
+    )
+  return ()
+
+
+def griddepcontrol_launch_dependents():
+  """Signal that dependents can be launched."""
+  griddepcontrol_launch_dependents_p.bind()
 
 
 inline_mgpu_p = jax_core.Primitive("inline_mgpu_p")
@@ -3087,11 +3357,7 @@ def _populate_custom_primitive_op_block(
           fn_inputs.append(arg)
           continue
 
-        _, transforms = (
-            mgpu.dialect_lowering.swizzle_and_transforms_from_transforms_attr(
-                ir.ArrayAttr(next(in_transforms_it))
-            )
-        )
+        transforms = ir.ArrayAttr(next(in_transforms_it))
         # The block arguments in the Mosaic GPU dialect are logical refs that
         # wrap the transfromed refs. Since the mgpu_fn works at the lowered
         # "lane" level, we need to transform (lower) the inputs before passing
@@ -3685,6 +3951,9 @@ def _async_copy_sparse_metadata_to_tmem_lowering_rule(*args, **kwargs):
 @lowering.register_lowering_rule(
     async_copy_sparse_metadata_to_tmem_p, mgpu.LoweringSemantics.Warpgroup
 )
+@lowering.register_lowering_rule(
+    async_copy_sparse_metadata_to_tmem_p, *gpu_core.WGxWARP_SEMANTICS
+)
 def _async_copy_sparse_metadata_to_tmem_lowering_rule_wg(*args, **kwargs):
   return _async_copy_to_tmem_lowering_rule(
       mgpu.dialect.async_store_sparse_metadata_smem_to_tmem,
@@ -3741,25 +4010,30 @@ def async_copy_smem_to_tmem(
 
 @async_copy_smem_to_tmem_p.def_effectful_abstract_eval
 def _async_copy_smem_to_tmem_abstract_eval(
-    smem_ref, tmem_ref, *args, smem_tree, **_kwargs
+    smem_ref, tmem_ref, *args, smem_tree, tmem_tree, **_kwargs
 ):
   if smem_ref.memory_space != gpu_core.MemorySpace.SMEM:
     raise ValueError("async_copy_smem_to_tmem source must be an SMEM ref")
   if tmem_ref.memory_space != gpu_core.MemorySpace.TMEM:
     raise ValueError("async_copy_smem_to_tmem target must be a TMEM ref")
-  smem_transforms = jax.tree.unflatten(smem_tree, args[:smem_tree.num_leaves])
+  smem_transforms, tmem_transforms = util.split_list(
+      args, [smem_tree.num_leaves]
+  )
   smem_aval = smem_ref
-  for t in smem_transforms:
+  for t in jax.tree.unflatten(smem_tree, smem_transforms):
     smem_aval = t.transform_type(smem_aval)
-  if smem_aval.dtype != tmem_ref.dtype:
+  tmem_aval = tmem_ref
+  for t in jax.tree.unflatten(tmem_tree, tmem_transforms):
+    tmem_aval = t.transform_type(tmem_aval)
+  if smem_aval.dtype != tmem_aval.dtype:
     raise ValueError(
         f"Expected SMEM element type ({smem_aval.dtype}) to equal the TMEM"
-        f" element type ({tmem_ref.dtype})"
+        f" element type ({tmem_aval.dtype})"
     )
-  if smem_aval.shape != tmem_ref.shape:
+  if smem_aval.shape != tmem_aval.shape:
     raise ValueError(
         f"Expected SMEM reference shape {smem_aval.shape} to equal the TMEM"
-        f" reference shape {tmem_ref.shape}"
+        f" reference shape {tmem_aval.shape}"
     )
   return (), {state_types.ReadEffect(0), state_types.WriteEffect(1)}
 
@@ -4047,8 +4321,9 @@ def try_cluster_cancel_lowering(
     barrier_transforms_leaves = transforms_leaves
 
   if barrier_transforms_tree is not None:
-    base_index = _extract_barrier_slice_base(
-        barrier_transforms_tree.unflatten(barrier_transforms_leaves)
+    base_index = _get_barrier_base_index(
+        ctx.avals_in[1],
+        barrier_transforms_tree.unflatten(barrier_transforms_leaves),
     )
     if base_index is not None:
       barrier = barrier[base_index]
@@ -4256,6 +4531,24 @@ class AtomicOpType(enum.Enum):
   XOR = "xor"
 
 
+def _atomic_op_type_to_int(atomic_type: AtomicOpType) -> int:
+  match atomic_type:
+    case AtomicOpType.ADD:
+      return 0
+    case AtomicOpType.MIN:
+      return 1
+    case AtomicOpType.MAX:
+      return 2
+    case AtomicOpType.AND:
+      return 3
+    case AtomicOpType.OR:
+      return 4
+    case AtomicOpType.XOR:
+      return 5
+    case _:
+      assert_never(atomic_type)
+
+
 atomic_store_p = jax_core.Primitive("mgpu_atomic_store")
 atomic_store_p.multiple_results = True
 
@@ -4364,24 +4657,7 @@ def _atomic_store_lowering_rule_wg(
         f"Unsupported transforms for atomic_store: {remaining_transforms}"
     )
 
-  def to_int_attr(atomic_type: AtomicOpType):
-    match atomic_type:
-      case AtomicOpType.ADD:
-        return 0
-      case AtomicOpType.MIN:
-        return 1
-      case AtomicOpType.MAX:
-        return 2
-      case AtomicOpType.AND:
-        return 3
-      case AtomicOpType.OR:
-        return 4
-      case AtomicOpType.XOR:
-        return 5
-      case _:
-        assert_never(atomic_type)
-
-  mgpu.dialect.vector_store(value, ref, atomic_type=to_int_attr(atomic_type))
+  mgpu.dialect.vector_store(value, ref, atomic_type=_atomic_op_type_to_int(atomic_type))
   return ()
 
 
@@ -4828,11 +5104,202 @@ def _semaphore_signal_multicast_lowering(
       else:
         mgpu_utils.warpgroup_barrier()
 
-    predicate = None
-    if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-      predicate = ctx.module_ctx.single_lane_predicate
+    assert ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane
+    predicate = ctx.module_ctx.single_lane_predicate
 
     mgpu_utils.SemaphoreRef.signal_multimem(
         mgpu_utils.memref_ptr(multi_ref), val, predicate=predicate
+    )
+  return ()
+
+semaphore_signal_p = jax_core.Primitive("semaphore_signal")
+semaphore_signal_p.multiple_results = True
+
+
+def semaphore_signal(
+    semaphore,
+    inc: int | jax.Array = 1,
+    *,
+    device_id: pallas_primitives.DeviceId | None = None,
+    memory_scope: Literal["sys", "gpu"] = "sys",
+):
+  """Signals a semaphore, optionally on a remote device.
+
+  This is the MGPU specific variant of :func:`pallas.semaphore_signal`,
+  which additionally exposes the ``memory_scope`` of the underlying atomic.
+
+  Args:
+    semaphore: The semaphore reference to signal.
+    inc: The increment value for the semaphore.
+    device_id: Optional logical device id at which to signal the semaphore.
+    memory_scope: The memory scope of the underlying atomic. Must be ``"sys"``
+      or ``"gpu"``. Defaults to ``"sys"``.
+  """
+  ref, transforms = pallas_primitives._get_ref_and_transforms(semaphore)
+  value = jnp.asarray(inc, dtype=jnp.int32)
+  core_index = None
+  args = [ref, transforms, value, device_id, core_index]
+  flat_args, args_tree = tree_util.tree_flatten(args)
+  semaphore_signal_p.bind(
+      *flat_args,
+      args_tree=args_tree,
+      device_id_type=pallas_primitives.DeviceIdType.MESH,
+      memory_scope=memory_scope,
+  )
+
+
+@semaphore_signal_p.def_effectful_abstract_eval
+def _semaphore_signal_abstract_eval(
+    *avals, args_tree, device_id_type, memory_scope
+):
+  del memory_scope  # Unused.
+  return pallas_primitives.semaphore_signal_p.abstract_eval(
+      *avals, args_tree=args_tree, device_id_type=device_id_type
+  )
+
+
+@lowering.register_lowering_rule(pallas_primitives.semaphore_signal_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(pallas_primitives.semaphore_signal_p, *gpu_core.LANExWARP_SEMANTICS)
+@lowering.register_lowering_rule(pallas_primitives.semaphore_signal_p, mgpu.LoweringSemantics.Warpgroup)
+@lowering.register_lowering_rule(pallas_primitives.semaphore_signal_p, *gpu_core.WGxWARP_SEMANTICS)
+@lowering.register_lowering_rule(semaphore_signal_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(semaphore_signal_p, *gpu_core.LANExWARP_SEMANTICS)
+@lowering.register_lowering_rule(semaphore_signal_p, mgpu.LoweringSemantics.Warpgroup)
+@lowering.register_lowering_rule(semaphore_signal_p, *gpu_core.WGxWARP_SEMANTICS)
+def _semaphore_signal_lowering_rule(
+    ctx: lowering.LoweringRuleContext,
+    *args,
+    args_tree,
+    device_id_type,
+    memory_scope: Literal["sys", "gpu"] = "sys",
+):
+  i32 = ir.IntegerType.get_signless(32)
+  sem, transforms, value, device_id, core_index = tree_util.tree_unflatten(
+      args_tree, args
+  )
+  sem_aval, transform_avals, _, device_id_aval, _ = tree_util.tree_unflatten(
+      args_tree, ctx.avals_in
+  )
+  if core_index is not None:
+    raise NotImplementedError(
+        "Mosaic GPU backend does not support the concept of cores, but"
+        " core_index is specified"
+    )
+  assert isinstance(sem_aval, state_types.AbstractRef)
+  sem, _, transforms = lowering._handle_transforms(
+      ctx, sem_aval, sem, transform_avals, transforms
+  )
+  if transforms:
+    raise NotImplementedError(f"Unhandled transforms for semaphore_signal: {transforms}")
+  if device_id is not None:
+    if memory_scope == "gpu":
+      raise ValueError(
+          "Cannot signal a GPU-local semaphore from a remote device. Please use"
+          " `memory_scope='sys'` instead."
+      )
+    device_id = lowering._device_id_to_logical(
+        ctx, device_id, device_id_type, device_id_aval
+    )
+    assert device_id is not None
+    device_id = lowering._ensure_ir_value(device_id, jnp.int32)
+    sem = ctx.launch_ctx.to_remote(sem, device_id)
+
+  val = lowering._ir_constant(value, i32)
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, [sem, val]) as [sem, val]:
+    sem_ptr = mgpu.utils.memref_ptr(sem)
+    # We only signal the semaphore from a single lane, which does not guarantee
+    # anything about the state of the other three warps in the warpgroup (they
+    # might still be e.g. reading memory that someone will overwrite once they
+    # receive a signal).
+    if ctx.module_ctx.auto_barriers:
+      if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+        mgpu_utils.warp_barrier()
+      else:
+        mgpu_utils.warpgroup_barrier()
+
+    mgpu_utils.SemaphoreRef(sem_ptr).signal(
+        val,
+        predicate=ctx.module_ctx.single_lane_predicate,
+        memory_scope=memory_scope,
+    )
+  return ()
+
+
+semaphore_wait_p = jax_core.Primitive("semaphore_wait")
+semaphore_wait_p.multiple_results = True
+
+
+def semaphore_wait(
+    semaphore,
+    value: int | jax.Array = 1,
+    *,
+    decrement: bool = True,
+    memory_scope: Literal["sys", "gpu"] = "sys",
+):
+  """Waits on a semaphore until it reaches at least ``value``.
+
+  This is the MGPU specific variant of :func:`pallas.semaphore_wait`,
+  which additionally exposes the ``memory_scope`` of the underlying atomic.
+
+  Args:
+    semaphore: The semaphore reference to wait on.
+    value: The target value that the semaphore should reach before unblocking.
+    decrement: Whether to decrement the semaphore by ``value`` once the wait
+      succeeds.
+    memory_scope: The memory scope of the underlying atomic. Must be ``"sys"``
+      or ``"gpu"``. Defaults to ``"sys"``.
+  """
+  ref, transforms = pallas_primitives._get_ref_and_transforms(semaphore)
+  value = jnp.asarray(value, dtype=jnp.int32)
+  args = [ref, transforms, value, decrement]
+  flat_args, args_tree = tree_util.tree_flatten(args)
+  semaphore_wait_p.bind(
+      *flat_args,
+      args_tree=args_tree,
+      memory_scope=memory_scope,
+  )
+
+
+@semaphore_wait_p.def_effectful_abstract_eval
+def _semaphore_wait_abstract_eval(*avals, args_tree, memory_scope):
+  del memory_scope  # Unused.
+  return pallas_primitives.semaphore_wait_p.abstract_eval(
+      *avals, args_tree=args_tree
+  )
+
+
+@lowering.register_lowering_rule(pallas_primitives.semaphore_wait_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(pallas_primitives.semaphore_wait_p, *gpu_core.LANExWARP_SEMANTICS)
+@lowering.register_lowering_rule(pallas_primitives.semaphore_wait_p, mgpu.LoweringSemantics.Warpgroup)
+@lowering.register_lowering_rule(pallas_primitives.semaphore_wait_p, *gpu_core.WGxWARP_SEMANTICS)
+@lowering.register_lowering_rule(semaphore_wait_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(semaphore_wait_p, *gpu_core.LANExWARP_SEMANTICS)
+@lowering.register_lowering_rule(semaphore_wait_p, mgpu.LoweringSemantics.Warpgroup)
+@lowering.register_lowering_rule(semaphore_wait_p, *gpu_core.WGxWARP_SEMANTICS)
+def _semaphore_wait_lowering_rule(
+    ctx: lowering.LoweringRuleContext,
+    *args,
+    args_tree,
+    memory_scope: Literal["sys", "gpu"] = "sys",
+):
+  sem, transforms, value, decrement = tree_util.tree_unflatten(args_tree, args)
+  sem_aval, transform_avals, *_ = tree_util.tree_unflatten(
+      args_tree, ctx.avals_in
+  )
+  assert isinstance(sem_aval, state_types.AbstractRef)
+  sem, _, transforms = lowering._handle_transforms(ctx, sem_aval, sem, transform_avals, transforms)
+  if transforms:
+    raise NotImplementedError(
+        f"Unhandled transforms for semaphore_wait: {transforms}"
+    )
+  val = lowering._ensure_ir_value(value, jnp.int32)
+
+  scope = mgpu.ThreadSubset.WARPGROUP
+  if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+    scope = mgpu.ThreadSubset.WARP
+
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, [sem, val]) as [sem, val]:
+    mgpu_utils.SemaphoreRef(mgpu.utils.memref_ptr(sem)).wait(
+        val, decrement=decrement, scope=scope, memory_scope=memory_scope,
     )
   return ()

@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library")
 load(
     "//jaxlib:jax.bzl",
+    "jax_visibility",
     "py_deps",
+    "pytype_library",
 )
 
 package(
@@ -25,7 +26,7 @@ package(
     ],
 )
 
-py_library(
+pytype_library(
     name = "pallas",
     srcs = [
         "__init__.py",
@@ -39,6 +40,10 @@ py_library(
         "primitives.py",
         "utils.py",
     ],
+    type_checking = "pyrefly",
+    visibility = [
+        "//jax:internal",
+    ] + jax_visibility("pallas"),
     deps = [
         "//jax",
         "//jax/_src:ad",
@@ -73,11 +78,12 @@ py_library(
     ] + py_deps("numpy"),
 )
 
-py_library(
+pytype_library(
     name = "pallas_test_util",
     srcs = [
         "pallas_test_util.py",
     ],
+    type_checking = "pyrefly",
     deps = [
         ":pallas",
         "//jax/_src:test_util",

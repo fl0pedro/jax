@@ -98,6 +98,38 @@ class TritonPallasTest(PallasBaseTest):
     self.assertEqual(y.dtype, dst_dtype)
     self.assertArraysEqual(y, x.astype(dst_dtype))
 
+  def test_float32_stack(self):
+    # Triton stack only supports 2 arguments and last dimension.
+    x = jax.random.normal(jax.random.key(0), (64, 64), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (64, 64), dtype=jnp.float32)
+
+    def kernel(x_ref, y_ref, out_ref):
+      out_ref[...] = jnp.stack([x_ref[...], y_ref[...]], axis=-1)
+
+    out = self.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((64, 64, 2), jnp.float32),
+        grid=(1,),
+    )(x, y)
+    np.testing.assert_allclose(out, np.stack([x, y], axis=-1))
+
+  def test_float32_unstack(self):
+    # Triton unstack only supports size 2 and last dimension.
+    x = jax.random.normal(jax.random.key(0), (64, 64, 2), dtype=jnp.float32)
+
+    def kernel(x_ref, out1_ref, out2_ref):
+      out1, out2 = jnp.unstack(x_ref[...], axis=-1)
+      out1_ref[...] = out1
+      out2_ref[...] = out2
+
+    out1, out2 = self.pallas_call(
+        kernel,
+        out_shape=(jax.ShapeDtypeStruct((64, 64), jnp.float32),
+                   jax.ShapeDtypeStruct((64, 64), jnp.float32)),
+        grid=(1,),
+    )(x)
+    np.testing.assert_allclose(out1, x[..., 0])
+    np.testing.assert_allclose(out2, x[..., 1])
   @parameterized.named_parameters(
       ("add_i32", "atomic_add", np.array([1, 2, 3, 4], np.int32), np.sum),
       ("max_i32", "atomic_max", np.array([1, 2, 3, 4], np.int32), np.max),
@@ -479,7 +511,7 @@ class TritonPallasTest(PallasBaseTest):
         out_shape=jax.ShapeDtypeStruct((32, 64), jnp.int32),
     )
     def dot_kernel(x_ref, y_ref, o_ref):
-      o_ref[()] = pl.dot(x_ref[()], y_ref[()])
+      o_ref[()] = plgpu.dot(x_ref[()], y_ref[()])
 
     x = jnp.ones((32, 128), dtype=jnp.uint8)
     y = jnp.ones((128, 64), dtype=jnp.uint8)
@@ -497,7 +529,7 @@ class TritonPallasTest(PallasBaseTest):
         compiler_params=plgpu.CompilerParams(num_warps=1),
     )
     def dot_kernel(x_ref, y_ref, o_ref):
-      o_ref[()] = pl.dot(x_ref[()], y_ref[()])
+      o_ref[()] = plgpu.dot(x_ref[()], y_ref[()])
 
     x = jnp.ones((m, k), dtype=dtype)
     y = jnp.ones((k, n), dtype=dtype)
@@ -516,7 +548,7 @@ class TritonPallasTest(PallasBaseTest):
         out_shape=jax.ShapeDtypeStruct((m, n), dtype), compiler_params=plgpu.CompilerParams(num_warps=1),
     )
     def dot_kernel(x_ref, y_ref, o_ref):
-      o_ref[()] = pl.dot(x_ref[()], y_ref[()])
+      o_ref[()] = plgpu.dot(x_ref[()], y_ref[()])
 
     x = jnp.arange(m * k).reshape(m, k).astype(dtype)
     y = jnp.arange(k * n).reshape(k, n).astype(dtype)
@@ -543,7 +575,7 @@ class TritonPallasTest(PallasBaseTest):
             compiler_params=plgpu.CompilerParams(num_warps=1),
         )
         def dot_kernel(x_ref, y_ref, o_ref):
-          o_ref[()] = pl.dot(x_ref[()], y_ref[()])
+          o_ref[()] = plgpu.dot(x_ref[()], y_ref[()])
 
         x = jnp.arange(m * k).reshape(m, k).astype(dtype)
         y = jnp.arange(k * n).reshape(k, n).astype(dtype)
@@ -593,7 +625,7 @@ def matmul(x, y, *, bm, bn, gm, bk, interpret, debug=False):
           lax.broadcast_in_dim(idx_n, (bk, bn), (1,)),
       )
       x_block, y_block = x_ref[x_idx], y_ref[y_idx]
-      out = pl.dot(x_block, y_block)
+      out = plgpu.dot(x_block, y_block)
       return acc + out
 
     acc = lax.fori_loop(0, k // bk, body, acc).astype(o_ref.dtype)

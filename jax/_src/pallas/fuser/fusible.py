@@ -20,7 +20,6 @@ import jax
 from jax._src import api_util
 from jax._src import core as jax_core
 from jax._src import hijax
-from jax._src.interpreters import batching
 from jax._src import linear_util as lu
 from jax._src.traceback_util import api_boundary
 from jax._src import tree_util
@@ -28,6 +27,7 @@ from jax._src import util
 from jax._src.interpreters import partial_eval as pe
 from jax._src.pallas.fuser import fusion as fusion_lib
 from jax._src.pallas.fuser import fusible_dtype
+from jax._src.lax.control_flow.loops import eval_jaxpr_p
 
 
 class Fusible(hijax.VJPHiPrimitive):
@@ -55,7 +55,20 @@ class Fusible(hijax.VJPHiPrimitive):
   def expand(self, *consts_and_args):
     consts, args = util.split_list(consts_and_args, [self.num_consts])
     flat_args = tree_util.tree_leaves(args)
-    out_flat = jax_core.eval_jaxpr(self.jaxpr, consts, *flat_args)
+    if self.jaxpr.is_high:
+      arg_avals = [jax_core.typeof(a) for a in flat_args]
+      lo_args = [
+          lo_val for aval, x in zip(arg_avals, flat_args)
+          for lo_val in (
+              aval.read_loval(x) if aval.has_qdd else aval.lower_val(x)
+          )
+      ]
+      lo_jaxpr = pe.lower_jaxpr2(jax_core.ClosedJaxpr(self.jaxpr, consts))
+    else:
+      lo_args = flat_args
+      lo_jaxpr = jax_core.ClosedJaxpr(self.jaxpr, consts)
+    lo_outs = eval_jaxpr_p.bind(*lo_args, jaxpr=lo_jaxpr)
+    out_flat = pe.raise_lo_outs(self.out_avals_flat, lo_outs)
     return tree_util.tree_unflatten(self.out_tree, out_flat)
 
   def vjp_fwd(self, in_nzs, *args):
@@ -65,12 +78,15 @@ class Fusible(hijax.VJPHiPrimitive):
   def vjp_bwd_retval(self, vjp_fun, outgrad):
     return vjp_fun(outgrad)
 
+  def jvp(self, primals, tangents):
+    return jax.jvp(self.expand, primals, tangents)
+
   def batch(self, axis_data, args, dims):
     if axis_data.size != 1:
       raise NotImplementedError("Fusible does not support non-trivial batching")
 
     def unbatch_leaf(a, d):
-      if d is batching.not_mapped or d is None:
+      if d is None:
         return a
       return a[d]
 

@@ -33,6 +33,7 @@ from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import remat
+from jax._src.partition_spec import PartitionSpec
 from jax._src.custom_derivatives import (
     CustomVJPPrimal, _temporary_dtype_exception, _check_for_returned_refs)
 from jax._src.errors import UnexpectedTracerError
@@ -185,7 +186,7 @@ class MutableHiType(core.AbstractValue):
 
 def register_hitype(val_cls, typeof_fn) -> None:
   core.pytype_aval_mappings[val_cls] = typeof_fn
-  dtypes.canonicalize_value_handlers[val_cls] = lambda x: x
+  dtypes.register_canonicalize_value_handler(val_cls, None)
 
 def hijax_method(f):
   return core.aval_method(f)
@@ -210,7 +211,7 @@ def box_set(box, val):
 
 ## Box implementation
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BoxTypeState(QDD):
   leaf_avals: tuple[core.AbstractValue, ...]
   treedef: PyTreeDef
@@ -899,13 +900,13 @@ def _set_up_nondiff(f, argnums_, argnames) -> frozenset[int]:
   return frozenset(argnums)
 
 @register_static
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Static:
   val: Any
 
 class MappingSpec: pass
 class HiPspec:
-  def to_lo(self) -> HiPspec: assert False, "must override"
+  def to_lo(self) -> tuple[PartitionSpec, ...]: assert False, "must override"
   def to_tangent_spec(self) -> HiPspec: assert False, "must override"
   def to_ct_spec(self) -> HiPspec: assert False, "must override"
 
@@ -963,6 +964,9 @@ class LogTy(MutableHiType):
 
   def to_tangent_aval(self):
     return LogTy()
+
+  def lo_ty_qdd(self, qdd: QDD, /) -> list[core.AbstractValue]:
+    return []
 
   def read_loval_in(self, qdd, log):
     () = qdd

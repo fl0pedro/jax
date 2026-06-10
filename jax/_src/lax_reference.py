@@ -71,25 +71,16 @@ acosh = np.arccosh
 atanh = np.arctanh
 
 def logistic(x): return (1 / (1 + np.exp(-x))).astype(x.dtype)
-# pyrefly: ignore[missing-attribute]
 def betainc(a, b, x): return scipy.special.betainc(a, b, x).astype(x.dtype)
-# pyrefly: ignore[missing-attribute]
 def lgamma(x): return scipy.special.gammaln(x).astype(x.dtype)
 def digamma(x): return scipy.special.digamma(x).astype(x.dtype)
-# pyrefly: ignore[missing-attribute]
 igamma = scipy.special.gammainc
-# pyrefly: ignore[missing-attribute]
 igammac = scipy.special.gammaincc
-# pyrefly: ignore[missing-attribute]
 def erf(x): return scipy.special.erf(x).astype(x.dtype)
-# pyrefly: ignore[missing-attribute]
 def erfc(x): return scipy.special.erfc(x).astype(x.dtype)
-# pyrefly: ignore[missing-attribute]
 def erf_inv(x): return scipy.special.erfinv(x).astype(x.dtype)
 
-# pyrefly: ignore[missing-attribute]
 def bessel_i0e(x): return scipy.special.i0e(x).astype(x.dtype)
-# pyrefly: ignore[missing-attribute]
 def bessel_i1e(x): return scipy.special.i1e(x).astype(x.dtype)
 
 real = np.real
@@ -117,6 +108,30 @@ def mul(x, y, /, *, out_dtype=None):
     x = np.astype(x, out_dtype)
     y = np.astype(y, out_dtype)
   return np.multiply(x, y)
+
+
+def mulhi(x, y):
+  x = np.asarray(x)
+  y = np.asarray(y)
+  dtype = x.dtype
+  if not np.issubdtype(dtype, np.integer):
+    raise TypeError(f'mulhi requires integer inputs, got {dtype}')
+  if dtype != y.dtype:
+    raise TypeError(
+        f'mulhi operands must have the same dtype, got {dtype} and {y.dtype}'
+    )
+  info = np.iinfo(dtype)
+  bits = info.bits
+  is_signed = np.issubdtype(dtype, np.signedinteger)
+  # For 64-bit inputs, use Python object dtype for arbitrary precision.
+  if bits == 64:
+    widen_dtype = np.dtype(object)
+  else:
+    widen_bits = bits * 2
+    widen_dtype = np.dtype(f'{"i" if is_signed else "u"}{widen_bits // 8}')
+  prod = x.astype(widen_dtype) * y.astype(widen_dtype)
+  return (prod >> bits).astype(dtype)
+
 
 def div(lhs, rhs):
   if dtypes.issubdtype(dtypes.result_type(lhs), np.integer):

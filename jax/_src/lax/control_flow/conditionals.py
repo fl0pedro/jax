@@ -32,7 +32,6 @@ from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import effects
-from jax._src import linear_util as lu
 from jax._src import source_info_util
 from jax._src import util
 from jax._src.state.discharge import register_partial_discharge_rule, discharge_state
@@ -464,13 +463,13 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
     raise NotImplementedError(
         "IO effect not supported in vmap-of-cond.")
 
-  if "branches_platforms" in params and (index_dim is not batching.not_mapped):
+  if "branches_platforms" in params and (index_dim is not None):
     # If we end up with a mapped index for a platform_dependent cond, we can
     # replace the index with a fresh call to platform_index. See #29329.
     index = platform_index_p.bind(platforms=params["branches_platforms"])
-    index_dim = batching.not_mapped
+    index_dim = None
 
-  if index_dim is not batching.not_mapped:
+  if index_dim is not None:
     # Convert to a lax.select. While we could get away with not broadcasting
     # some operands yet, because all outputs must be broadcast together anyway
     # for the select we broadcast the input operands for simplicity and leave
@@ -499,7 +498,7 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
     out = [_bcast_select_n(index, *outs) for outs in zip(*branch_outs)]
     return out, [0 if b else None for b in out_batched]
   else:
-    ops_bat = [d is not batching.not_mapped for d in op_dims]
+    ops_bat = [d is not None for d in op_dims]
     ops = [batching.moveaxis(x, d, 0) if b else x
            for b, x, d in zip(ops_bat, ops, op_dims)]
 
@@ -511,7 +510,7 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
         batching.batch_jaxpr(jaxpr, axis_data, ops_bat, out_bat)[0]
         for jaxpr in branches)
 
-    out_dims = [0 if b else batching.not_mapped for b in out_bat]
+    out_dims = [0 if b else None for b in out_bat]
     out = cond_p.bind(index, *ops, branches=branches_batched,
                       **params)
     return out, out_dims
@@ -766,12 +765,11 @@ def _join_cond_outputs(jaxprs: Sequence[core.ClosedJaxpr],
     def f_aug(*args):
       outs_and_residuals = core.jaxpr_as_fun(jaxpr)(*args)
       outs, residuals = split_list(outs_and_residuals, [num_non_res_outputs])
-      aug_residuals = map(ad_util.zeros_like_aval, all_res_avals)
+      aug_residuals = map(ad_util.empty_like_aval, all_res_avals)
       aug_residuals = util.subvals(aug_residuals, zip(res_indices, residuals))
       return outs + list(aug_residuals)
 
-    wrapped_f_aug = lu.wrap_init(f_aug, debug_info=jaxpr.jaxpr.debug_info)
-    return _make_closed_jaxpr(wrapped_f_aug, jaxpr.in_avals)
+    return _make_closed_jaxpr(f_aug, jaxpr.in_avals, jaxpr.jaxpr.debug_info)
 
   return tuple(map(augment_jaxpr, jaxprs, res_aval_indices_per_jaxpr))
 
@@ -856,7 +854,6 @@ def _cond_transpose_fancy(cts_in, index, *args, branches, **params):
 
 @util.weakref_lru_cache
 def _transpose_jaxpr_fancy(jaxpr, in_tree, in_avals, specs, inst_out):
-  cell = lambda: None
   maybe_inst = lambda x, inst: ad.instantiate_zeros(x) if inst else x
   def transposed(*in_flat):
     primals_ctrefs, cts_in = tree_unflatten(in_tree, in_flat)
@@ -864,12 +861,12 @@ def _transpose_jaxpr_fancy(jaxpr, in_tree, in_avals, specs, inst_out):
     ad.backward_pass3(jaxpr.jaxpr, False, jaxpr.consts, args, cts_in)
     cts_out = [maybe_inst(x.freeze(), inst) if isinstance(x, ad.ValAccum)
                else None for x, inst in zip(args, inst_out)]
-    cts_out, cell.out_tree = tree_flatten(cts_out)  # pyrefly: ignore[missing-attribute]
     return cts_out
   dbg = jaxpr.jaxpr.debug_info.with_unknown_names()
-  trans_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
-      lu.wrap_init(transposed, debug_info=dbg), in_avals)
-  return core.ClosedJaxpr(trans_jaxpr, consts), cell.out_tree  # pyrefly: ignore[missing-attribute]
+  closed_jaxpr, out_avals = pe.trace_to_jaxpr(
+      transposed, FlatTree.flatten_args(*in_avals), dbg
+  )
+  return closed_jaxpr, out_avals.tree
 
 
 def _cond_typecheck(bind_time, *in_atoms, branches, **params):
@@ -1022,8 +1019,8 @@ def _cond_lowering(ctx, index, *args, branches, **params):
   tokens_in = ctx.tokens_in.subset(ordered_effects)
   output_token_types = [mlir.token_type() for _ in ordered_effects]
   output_types = [
-      *output_token_types, *map(mlir._aval_to_ir_types, ctx.avals_out)]
-  flat_output_types = mlir.flatten_ir_types(output_types)
+      *output_token_types, *map(partial(mlir._aval_to_ir_types, ctx.module_context), ctx.avals_out)]
+  flat_output_types, treedef = mlir.ir_tree_registry.flatten(output_types)
 
   # CaseOp takes a single argument 'index' and the corresponding blocks
   # have no arguments; the computation within the block uses implicit
@@ -1043,14 +1040,14 @@ def _cond_lowering(ctx, index, *args, branches, **params):
           outer_traceback=ctx.traceback)
       out_tokens = [tokens_out.get(eff) for eff in ordered_effects]
       out_vals = [*out_tokens, *out_vals]
-      hlo.return_(mlir.flatten_ir_values(out_vals))
+      flat_out_vals, _ = mlir.ir_tree_registry.flatten(out_vals)
+      hlo.return_(flat_out_vals)
 
-  tokens_and_outputs = mlir.unflatten_ir_values_like_types(
-    case_op.results, output_types)
+  tokens_and_outputs = treedef.unflatten(case_op.results)
   tokens, outputs = util.split_list(tokens_and_outputs, [num_tokens])
   outputs = [mlir.lower_with_sharding_in_types(ctx, o, aval)
              for o, aval in zip(outputs, ctx.avals_out)]
-  ctx.set_tokens_out(mlir.TokenSet(zip(ordered_effects, tokens)))
+  ctx.set_tokens_out(mlir.TokenSet(dict(zip(ordered_effects, tokens))))
   return outputs
 
 mlir.register_lowering(cond_p, _cond_lowering)
@@ -1059,9 +1056,10 @@ mlir.register_lowering(cond_p, _cond_lowering)
 def _cond_state_discharge_rule(should_discharge, in_avals, out_avals, index, *args,
                                branches, **params):
   assert not should_discharge[0], "Can't discharge the index."
-  discharged_branches, discharged_consts = unzip2(
-      discharge_state(branch.jaxpr, branch.consts, should_discharge=should_discharge[1:])
-      for branch in branches)
+  discharged_branches = tuple(
+      discharge_state(branch, should_discharge=should_discharge[1:])
+      for branch in branches
+  )
   # Don't thread the ref values through the cond if they never change.
   forwarded_outvars: list[int | None] | None = None
   for branch in discharged_branches:
@@ -1077,10 +1075,14 @@ def _cond_state_discharge_rule(should_discharge, in_avals, out_avals, index, *ar
           for i, j in zip(forwarded_outvars, branch_forwarding)]
   assert forwarded_outvars is not None
   all_outvars_fwd = [None] * len(out_avals) + forwarded_outvars
-  new_branches = tuple(core.ClosedJaxpr(
-          branch.replace(outvars=[v for v, fwd in zip(branch.outvars, all_outvars_fwd)
-                                  if fwd is None]), consts)
-      for branch, consts in zip(discharged_branches, discharged_consts))
+  new_branches = tuple(
+      branch.replace(
+          jaxpr=branch.jaxpr.replace(
+              outvars=[v for v, fwd in zip(branch.outvars, all_outvars_fwd) if fwd is None]
+          )
+      )
+      for branch in discharged_branches
+  )
   out_vals_no_fwd = cond_p.bind(index, *args, branches=new_branches,
                                 **params)
   out_vals, out_ref_vals_no_fwd = util.split_list(out_vals_no_fwd, [len(out_avals)])

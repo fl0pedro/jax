@@ -15,13 +15,14 @@
 from __future__ import annotations
 
 import collections
+from collections.abc import Callable
 from collections.abc import Sequence
 import dataclasses
 import gc
 import logging
 import threading
+import traceback
 from typing import Any, Literal
-from collections.abc import Callable
 
 from jax._src.pallas.mosaic.interpret import vector_clock as vc
 import jax._src.pallas.mosaic.interpret.params as params
@@ -48,6 +49,13 @@ class Semaphore:
     self.cv = threading.Condition()
 
     self.count_by_core = np.zeros(self.shared_memory.num_cores, dtype=np.int32)
+
+    # (global_core_id) -> tasks that will signal the semaphore on the core with
+    #   the given ID and that should therefore be considered for execution when
+    #   the semaphore is waiting (to be signalled).
+    self.tasks: list[list[SemaphoreTask]] = [
+        [] for _ in range(self.shared_memory.num_cores)
+    ]
 
     if self.shared_memory.detect_races:
       # We associate a vector clock with each count in self.counts.  Whenever
@@ -88,6 +96,11 @@ class Semaphore:
 
   def get_global_core_id(self, device_id: int, local_core_id: int) -> int:
     return self.shared_memory.get_global_core_id(device_id, local_core_id)
+
+  def enqueue_task(self, task: SemaphoreTask, global_core_id: int):
+    with self.cv:
+      self.tasks[global_core_id].append(task)
+      self.cv.notify_all()
 
   def signal(
       self,
@@ -140,51 +153,6 @@ class Semaphore:
   ):
     global_core_id = int(global_core_id)
 
-    # TODO(jburnim):
-    #  - If the count is larger than value, raise an error?
-    #  - If the count is equal to value, but there DMAs waiting to signal us,
-    #    raise an error?
-
-    # Simple implementation for semaphores that have no tasks that can signal
-    # them.
-    clock = None
-    if not has_tasks:
-      with self.cv:
-        while self.count_by_core[global_core_id] < value:
-          if self.enable_logging and logging_info is not None:
-            self._log(
-                logging_info.format(
-                    f"semaphore={self.id} waiting,"
-                    f" {int(self.count_by_core[global_core_id])}(count_on_core)"
-                    f" < {value}(value).\n"
-                    f"count_by_core={self.count_by_core.tolist()}.",
-                    line_prefix="`wait`",
-                )
-            )
-          self.cv.wait()
-        self.count_by_core[global_core_id] -= value
-
-        if self.enable_logging and logging_info is not None:
-          self._log(
-              logging_info.format(
-                  f"semaphore={self.id} finished waiting for {value=}, "
-                  f"count_on_core={int(self.count_by_core[global_core_id])}.\n"
-                  f"count_by_core={self.count_by_core.tolist()}.",
-                  line_prefix="`wait`",
-              )
-          )
-
-        if self.detect_races:
-          assert self.clocks[global_core_id] is not None
-          clock = vc.copy_vector_clock(self.clocks[global_core_id])
-      if self.detect_races:
-        with self.shared_memory.lock:
-          assert clock is not None
-          vc.update_vector_clock(
-              self.shared_memory.clocks[global_core_id], clock
-          )
-      return
-
     # TODO(nrink): Update the comment below to generalize from DMAs and DMA
     # semaphores. We now have the concept of 'tasks' that can signal a
     # semaphore. At the moment, DMAs are the only tasks that occur; and what is
@@ -200,26 +168,21 @@ class Semaphore:
     # out-of-order.  This approach also lets us avoid the complexity of spinning
     # up separate threads to handle executing DMAs.
     while True:
+      self.shared_memory.check_failed()
+
       clock = None
       done = False
+      task = None
       with self.cv:
+        # TODO(jburnim):
+        #  - If the count is larger than value, raise an error?
+        #  - If the count is equal to value, but there DMAs waiting to signal
+        #    us, raise an error?
         if self.count_by_core[global_core_id] >= value:
           self.count_by_core[global_core_id] -= value
-          if self.detect_races:
-            assert self.clocks[global_core_id] is not None
-            clock = vc.copy_vector_clock(self.clocks[global_core_id])
-          else:
-            done = True
-      if clock is not None:
-        with self.shared_memory.lock:
-          vc.update_vector_clock(
-              self.shared_memory.clocks[global_core_id], clock
-          )
-        done = True
-
-      if done:
-        if self.enable_logging and logging_info is not None:
-          self._log(
+          done = True
+          if self.enable_logging and logging_info is not None:
+            self._log(
               logging_info.format(
                   f"semaphore={self.id} finished waiting for {value=}, "
                   f"count_on_core={int(self.count_by_core[global_core_id])}.\n"
@@ -227,16 +190,27 @@ class Semaphore:
                   line_prefix="`wait`",
               )
           )
+          if self.detect_races:
+            assert self.clocks[global_core_id] is not None
+            clock = vc.copy_vector_clock(self.clocks[global_core_id])
+        elif len(self.tasks[global_core_id]) > 0:
+          task = self.tasks[global_core_id].pop()
+        else:
+          # We need to set a timeout here so that we periodically check for
+          # failures set in `self.shared_memory`.
+          self.cv.wait(timeout=0.1)
+
+      if clock is not None:
+        with self.shared_memory.lock:
+          vc.update_vector_clock(
+              self.shared_memory.clocks[global_core_id], clock
+          )
+
+      if done:
         return
 
-      with self.shared_memory.lock:
-        task_queue = self.shared_memory.tasks_by_sem[(self.id, global_core_id)]
-        if len(task_queue) > 0:
-          task = task_queue.pop()
-        else:
-          continue
-
-      task()
+      if task is not None:
+        task()
 
 
 # A `SemaphoreTask` is called when a semaphore is waiting to be signalled on a
@@ -255,22 +229,135 @@ class Allocation:
   ...
 
 
-@dataclasses.dataclass
 class Buffer(Allocation):
-  content: np.ndarray
-  _: dataclasses.KW_ONLY
-  ref_count: int = 1
+
+  def __init__(
+      self,
+      content: np.ndarray,
+      ref_count: int = 1,
+      logical_shape: tuple[int, ...] | None = None,
+  ):
+    super().__init__()
+
+    self._content = content
+    self._ref_count = ref_count
+
+    if logical_shape is None:
+      self._logical_shape = tuple(self._content.shape)
+    else:
+      self._logical_shape = logical_shape
+
+    for dim, ldim in zip(self.content.shape, self.logical_shape, strict=True):
+      if ldim > dim:
+        raise ValueError(
+            f"Logical shape {self.logical_shape} cannot be bigger than content"
+            f" shape {self.content.shape}."
+        )
+
+  @property
+  def content(self) -> np.ndarray:
+    return self._content
+
+  @property
+  def ref_count(self) -> int:
+    return self._ref_count
+
+  @property
+  def logical_shape(self) -> tuple[int, ...]:
+    return self._logical_shape
 
   def decrease_ref_count(self):
     # We should never decrease the `ref_count` to below zero.
     assert self.ref_count > 0
-    self.ref_count -= 1
+    self._ref_count -= 1
 
   def has_zero_ref_count(self) -> bool:
     return self.ref_count == 0
 
+  @property
   def size(self) -> int:
     return self.content.itemsize * self.content.size
+
+  @property
+  def shape(self) -> tuple[int, ...]:
+    return self.content.shape
+
+  @property
+  def dtype(self) -> np.dtype:
+    return self.content.dtype
+
+  def _normalize_range(
+      self, rnge: tuple[slice | int, ...]
+  ) -> tuple[slice | int, ...]:
+    """Normalizes `rnge` by adding slices to match the `self.logical_shape`."""
+    assert len(self.logical_shape) == len(self.shape)
+    return rnge + tuple(slice(0, s) for s in self.logical_shape[len(rnge):])
+
+  def __getitem__(self, rnge: tuple[slice | int, ...]) -> np.ndarray:
+    """Returns the portion of `self.content` specified by `rnge`.
+
+    Args:
+      rnge: The range to read.
+
+    Raises:
+      IndexError: If `rnge` is entirely out of bounds for the allocated array in
+        the `Buffer`, i.e. `rnge` is out of bounds for `self.shape`.
+
+    Returns:
+      The portion of `self.content` specified by `rnge`.
+    """
+    rnge = self._normalize_range(rnge)
+    rnge_or_none = interpret_utils.clip_range_to_shape(rnge, self.shape)
+    if rnge_or_none is None:
+      # Raise if reading entirely outside of the allocated shape. We leave it to
+      # the client to handle the case where out-of-bounds reads are allowed (and
+      # should return uninitialized values).
+      raise IndexError(
+          f"Range {rnge} is entirely out of bounds for shape {self.shape}."
+      )
+
+    rnge = rnge_or_none
+    return self.content[rnge]
+
+  def _set_within_logical_shape(
+      self, rnge: tuple[slice | int, ...], value: np.ndarray
+  ):
+    """Updates `self.content` with `value` for the portion of `rnge` within `self.logical_shape`."""
+    rnge_or_none = interpret_utils.clip_range_to_shape(rnge, self.logical_shape)
+    if rnge_or_none is None:
+      return
+
+    rnge = rnge_or_none
+    shape_to_write = self.content[rnge].shape
+    self.content[rnge] = value[tuple(slice(0, s) for s in shape_to_write)]
+
+  def __setitem__(self, rnge: tuple[slice | int, ...], value: np.ndarray):
+    """Updates `self.content` with `value`, if `rnge` is fully within `self.shape`.
+
+    Args:
+      rnge: The range to write.
+      value: The value to write.
+
+    Raises:
+      IndexError: If any part of `rnge` is out of bounds for the allocated array
+        in the `Buffer`, i.e. if any part of `rnge` is out of bounds for
+        `self.shape`.
+    """
+    rnge = self._normalize_range(rnge)
+    if interpret_utils.is_range_out_of_bounds_for_shape(rnge, self.shape):
+      raise IndexError(
+          f"Range {rnge} is (at least partially) out of bounds for"
+          f" allocation shape {self.shape}."
+      )
+
+    self._set_within_logical_shape(rnge, value)
+
+  def set_in_bounds_portion(
+      self, rnge: tuple[slice | int, ...], value: np.ndarray
+  ):
+    """Updates `self.content` with `value` for the portion of `rnge` within `self.logical_shape`."""
+    rnge = self._normalize_range(rnge)
+    self._set_within_logical_shape(rnge, value)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -286,7 +373,7 @@ class ShapeAndDtype:
 class SharedMemory:
   num_devices: int
   num_cores_per_device: int
-  out_of_bounds_reads: str
+  out_of_bounds_reads: Literal["raise", "uninitialized"]
   dma_execution_mode: str
   uninitialized_memory: Literal["nan", "zero"]
   detect_races: bool
@@ -295,6 +382,8 @@ class SharedMemory:
   clocks: list[vc.VectorClock]
   barrier: threading.Barrier
   clean_up_barrier: threading.Barrier
+
+  buffer_bounds: Literal["logical", "padded"] | None = None
 
   logging_mode: params.LoggingMode | None = None
 
@@ -305,14 +394,6 @@ class SharedMemory:
 
   # semaphore_id -> Semaphore
   sem: dict[int, Semaphore] = dataclasses.field(default_factory=dict)
-
-  # (semaphore_id, global_core_id)
-  #   -> tasks that will signal the semaphore on the core with the given ID and
-  #      that should therefore be considered for execution when the semaphore is
-  #      waiting (to be signalled).
-  tasks_by_sem: dict[tuple[int, int], list[SemaphoreTask]] = dataclasses.field(
-      default_factory=lambda: collections.defaultdict(list)
-  )
 
   lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
@@ -336,6 +417,10 @@ class SharedMemory:
   fixed_id_sem: dict[int, Semaphore] = dataclasses.field(
       default_factory=dict
   )
+
+  _failure: Exception | None = None
+  _failed_device: int | None = None
+  _failed_core: int | None = None
 
   @property
   def num_cores(self) -> int:
@@ -368,6 +453,70 @@ class SharedMemory:
     for msg in message.split("\n"):
       logger.info(msg)
 
+  def _unsafe_get_semaphore(self, sem_id: int) -> Semaphore:
+    """Returns the semaphore with the given ID. `self.lock` must be held."""
+
+    if sem_id in self.fixed_id_sem:
+      if sem_id in self.sem:
+        # TODO(nrink): For now we make it the responsibility of the client to
+        # ensure that fixed-ID semaphores do not collide with internal
+        # semaphore IDs.
+        raise ValueError(
+            f'Semaphore {sem_id} occurs as both fixed-id and internal.'
+        )
+      return self.fixed_id_sem[sem_id]
+    else:
+      return self.sem[sem_id]
+
+  def set_failed(
+      self,
+      exception: Exception,
+      device_id: int | None = None,
+      local_core_id: int | None = None,
+      top_level: bool = True,
+  ):
+    with self.lock:
+      if self._failure is None:
+        self._failure = exception
+        self._failed_device = device_id
+        self._failed_core = local_core_id
+
+    self.barrier.abort()
+
+    # If we are interpreting a kernel over N devices, we must wait N times
+    # on the clean-up barrier.  As the computation on this device has failed
+    # and will soon raise an exception, this device will not reach its final
+    # call to `_clean_up_shared_memory` (which waits on the clean-up barrier).
+    # So, we wait on the barrier here.
+    #
+    # Unless we are running inside a thread_map (i.e., top_level=False) -- in
+    # which case we are one of the num_cores_per_device computations running for
+    # one of the N devices.  In this case, do not wait on the barrier here.
+    # The thread_map will detect that one or more of its threads failed and,
+    # once all of its threads have completed (successfully or with an error),
+    # it will call `set_failed` with `top_level=True`.
+    if top_level:
+      self.clean_up_barrier.wait()
+
+  def check_failed(self):
+    with self.lock:
+      if self._failure is not None:
+        # __cause__ information is lost when an exception from a callback goes
+        # through XLA and back to Python, so we stuff the information into the
+        # exception message.
+        #
+        # TODO(jburnim): The top-level exception (that the user sees) will not
+        # always contain the original exception info/message.  It currently
+        # depends on which raise (the raise here or the raise in the thread
+        # that calls `set_failed`) happens first. (And maybe some other details
+        # in XLA.)  We should figure out how to reliably propagate the
+        # original exception.
+        failure_str = "".join(traceback.format_exception(self._failure))
+        raise RuntimeError(
+            f"Computation failed on device {self._failed_device}, core"
+            f" {self._failed_core} with exception:\n\n{failure_str}"
+        ) from None
+
   def append_semaphore_task(
       self,
       semaphore_id: int,
@@ -376,7 +525,8 @@ class SharedMemory:
   ):
     """Appends a task to be executed if the semaphore with the given sempahore ID is waiting to be signalled on the core with the given global core ID."""
     with self.lock:
-      self.tasks_by_sem[(semaphore_id, global_core_id)].append(task)
+      sem = self._unsafe_get_semaphore(semaphore_id)
+    sem.enqueue_task(task, global_core_id)
 
   def get_random_virtual_device_id(self) -> int:
     # Virtual device IDs are needed for DMAs. Conceptually, each DMA runs on its
@@ -444,17 +594,8 @@ class SharedMemory:
       for sem_id in sem_ids:
         if sem_id is None:
           sem = None
-        elif sem_id in self.fixed_id_sem:
-          if sem_id in self.sem:
-            # TODO(nrink): For now we make it the responsibility of the client to
-            # ensure that fixed-ID semaphores do not collide with internal
-            # semaphore IDs.
-            raise ValueError(
-                f'Semaphore {sem_id} occurs as both fixed-id and internal.'
-            )
-          sem = self.fixed_id_sem[sem_id]
         else:
-          sem = self.sem[sem_id]
+          sem = self._unsafe_get_semaphore(sem_id)
         sems.append(sem)
 
     return sems, clock
@@ -465,11 +606,12 @@ class SharedMemory:
     """Returns tuples (semaphore, global_core_id) for all semaphores with a nonzero count for the core with `global_core_id`."""
     result = []
     with self.lock:
-      for _, sem in self.sem.items() | self.fixed_id_sem.items():
-        with sem.cv:
-          for gci in self.get_global_core_ids(device_id):
-            if sem.count_by_core[gci] != 0:
-              result.append((sem, gci))
+      sems = self.sem.items() | self.fixed_id_sem.items()
+    for _, sem in sems:
+      with sem.cv:
+        for gci in self.get_global_core_ids(device_id):
+          if sem.count_by_core[gci] != 0:
+            result.append((sem, gci))
     return result
 
   def get_next_buffer_id(self, device_id: int, local_core_id: int) -> int:
@@ -484,17 +626,24 @@ class SharedMemory:
       key: Any,
       ref_count: int,
       value: np.ndarray,
+      logical_shape: tuple[int, ...] | None = None,
       logging_info: interpret_utils.LoggingInfo | None = None,
   ):
     """Allocates a memory buffer with the given key unless it already exists."""
     with self.lock:
       if key not in self.mem:
-        self.mem[key] = Buffer(value, ref_count=ref_count)
+        buff = Buffer(
+            value, ref_count=ref_count, logical_shape=logical_shape
+        )
+        self.mem[key] = buff
 
         if self.enable_logging and logging_info is not None:
           self._log(
               logging_info.format(
-                  f"{key=}, {ref_count=}.", line_prefix="`allocate_buffer`"
+                  f"{key=}, {ref_count=}.\nvalue_shape={value.shape},"
+                  f" logical_shape={buff.logical_shape},"
+                  f" content_shape={buff.shape}",
+                  line_prefix="`allocate_buffer`",
               )
           )
 
@@ -513,7 +662,7 @@ class SharedMemory:
       buff.decrease_ref_count()
       if buff.has_zero_ref_count():
         self.mem.pop(key)
-        self.deallocated_bytes += buff.size()
+        self.deallocated_bytes += buff.size
         del buff
 
         if self.enable_logging and logging_info is not None:
@@ -595,8 +744,8 @@ class SharedMemory:
       logging_info: Information about the source of the read.
 
     Returns:
-      - The contents of the read range of the buffer, or None if reading out of
-        bounds.
+      - The contents of the read range of the buffer, or None if reading
+        entirely out of bounds.
       - The shape and dtype of the full content array of the buffer.
       - The incremented vector clock for the core with the given global core ID.
         None if race detection is not enabled or if `increment_clock` is False.
@@ -613,24 +762,26 @@ class SharedMemory:
             f"Attempting to get contents of allocation with key `{key}` that is"
             " not a `Buffer`."
         )
-      array = buff.content
+      shape_and_dtype = ShapeAndDtype(buff.logical_shape, buff.dtype)
 
       try:
-        result = array[rnge].copy()
-      except:
+        result = buff[rnge].copy()
+      except IndexError:
+        # `buf` was accessed with `rnge` entirely out of bounds.
         result = None
 
       if self.enable_logging and logging_info is not None:
         self._log(
             logging_info.format(
                 f"{key=}, {rnge=},"
-                f" in_bounds={result is not None}.\nbuffer_shape={array.shape},"
+                f" in_bounds={result is not None}.\n"
+                f"logical_shape={buff.logical_shape},"
+                f" content_shape={buff.shape},"
                 f" {f'{result.shape=}' if result is not None else ''}.",
                 line_prefix="`get_buffer_content`",
             )
         )
 
-    shape_and_dtype = ShapeAndDtype(array.shape, array.dtype)
     return result, shape_and_dtype, clock
 
   def store_buffer_content(
@@ -654,7 +805,8 @@ class SharedMemory:
       logging_info: Information about the source of the store.
 
     Returns:
-      - True of the store was in bounds, False otherwise.
+      - True if the store was entirely in bounds, False otherwise (i.e. if the
+        store was at least partially out of bounds).
       - The shape and dtype of the full content array of the buffer.
       - The incremented vector clock for the core with the given global core ID.
         None if race detection is not enabled or if `increment_clock` is False.
@@ -671,24 +823,24 @@ class SharedMemory:
             f"Attempting to store into allocation with key `{key}` that is not"
             " a `Buffer`."
         )
-      array = buff.content
-      shape_and_dtype = ShapeAndDtype(array.shape, array.dtype)
+      shape_and_dtype = ShapeAndDtype(buff.logical_shape, buff.dtype)
 
-      assert array.dtype == value.dtype  # TODO(jburnim): Catch this statically.
-      # TODO(jburnim): Better error message if this raises?
-      in_bounds_shape = array[rnge].shape
-      if in_bounds_shape == value.shape:
+      assert buff.dtype == value.dtype  # TODO(jburnim): Catch this statically.
+
+      try:
+        buff[rnge] = value
         is_in_bounds = True
-        array[rnge] = value
-      else:
+      except IndexError:
+        # `buf` was accessed with `rnge` at least partially out of bounds.
         is_in_bounds = False
 
       if self.enable_logging and logging_info is not None:
         self._log(
             logging_info.format(
                 f"{key=}, {rnge=},"
-                f" in_bounds={is_in_bounds}.\nbuffer_shape={array.shape},"
-                f" {value.shape=}.",
+                f" in_bounds={is_in_bounds}.\n"
+                f"logical_shape={buff.logical_shape},"
+                f" content_shape={buff.shape}, {value.shape=}.",
                 line_prefix="`store_buffer_content`",
             )
         )
@@ -737,43 +889,52 @@ class SharedMemory:
             " `Buffer`."
         )
 
-      array = buff.content
-      shape_and_dtype = ShapeAndDtype(array.shape, array.dtype)
+      shape_and_dtype = ShapeAndDtype(buff.logical_shape, buff.dtype)
 
-      assert array.dtype == value.dtype  # TODO(jburnim): Catch this statically.
+      assert buff.dtype == value.dtype  # TODO(jburnim): Catch this statically.
       # TODO(jburnim): Better error message if this raises?
-      raw_result = array[rnge]
-      in_bounds_shape = raw_result.shape
 
-      if mask is None:
-        if in_bounds_shape == value.shape:
-          array[rnge] = value
-          result = raw_result.copy()
+      try:
+        result = buff[rnge].copy()
+      except IndexError:
+        # `buf` was accessed with `rnge` entirely out of bounds.
+        result = None
+
+      if result is not None:
+        in_bounds_shape = result.shape
+
+        if mask is None:
+          assert in_bounds_shape == value.shape
+          buff[rnge] = value
         else:
-          result = None
-      else:
-        in_bounds_mask = np.full(mask.shape, True)
-        for i in range(len(in_bounds_shape)):
-          in_bounds_mask[in_bounds_shape[i] :] = False
-        if (~in_bounds_mask & mask).any():
-          result = None
-        else:
-          in_bounds_idx = tuple(slice(i) for i in in_bounds_shape)
-          result = value.copy()
-          result[in_bounds_idx] = np.where(
-              mask[in_bounds_idx], raw_result, value[in_bounds_idx]
-          )
-          array[rnge] = np.where(
-              mask[in_bounds_idx], value[in_bounds_idx], raw_result
-          )
-          result = result.copy()
+          in_bounds_mask = np.full(mask.shape, True)
+          for i in range(len(in_bounds_shape)):
+            in_bounds_mask[in_bounds_shape[i] :] = False
+          if (~in_bounds_mask & mask).any():
+            result = None
+          else:
+            in_bounds_idx = tuple(slice(i) for i in in_bounds_shape)
+            raw_result = result
+            result = value.copy()
+            result[in_bounds_idx] = np.where(
+                mask[in_bounds_idx], raw_result, value[in_bounds_idx]
+            )
+            buff.set_in_bounds_portion(
+                rnge,
+                np.where(mask[in_bounds_idx], value[in_bounds_idx], raw_result),
+            )
+            # Assert that `np.where` is not a view, and hence, in particular,
+            # does not share underlying memory with `buff.content`.
+            assert result.base is None
 
       if self.enable_logging and logging_info is not None:
         self._log(
             logging_info.format(
                 f"{key=}, {rnge=},"
-                f" in_bounds={result is not None}.\nbuffer_shape={array.shape},"
-                f" {f'{result.shape=}' if result is not None else ''}"
+                f" in_bounds={result is not None}.\n"
+                f"logical_shape={buff.logical_shape},"
+                f" content_shape={buff.shape},"
+                f" {f'{result.shape=}' if result is not None else ''},"
                 f" {value.shape=}.",
                 line_prefix="`swap_buffer_content`",
             )

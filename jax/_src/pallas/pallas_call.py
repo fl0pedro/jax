@@ -17,18 +17,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence, Set
 import contextlib
-import enum
-from functools import partial, reduce
+from functools import partial
 import math
-import types
 from typing import Any, cast
 
 from jax._src import ad_util
 from jax._src import api
 from jax._src import api_util
-from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src import deprecations
 from jax._src import effects
 from jax._src import hijax
 from jax._src import linear_util as lu
@@ -77,7 +75,7 @@ pallas_call_p.multiple_results = True
 def _pallas_call_impl(*args, **params):
 
   # Call the lowering path
-  @partial(api.jit, inline=True)
+  @api.jit(inline=True)
   def _jit_run(*args):
     return pallas_call_p.bind(*args, **params)
 
@@ -99,10 +97,6 @@ def _pallas_call_abstract_eval(
   del params  # Unused.
 
   effs: Set[jax_core.Effect] = {*pallas_core.get_interpret_effects(interpret)}
-  if not effs and getattr(compiler_params, "has_side_effects", False):
-    # TODO(slebedev): Fix internal breakages and add
-    # ``jax_core.GenericEffect(pallas_call_p)`` here.
-    effs = jax_core.no_effects
 
   # closed-over refs and dynamic grid bounds aren't reflected in
   # input_output_aliases, though they are present in `avals`, so split them off
@@ -362,7 +356,7 @@ def _batch_block_mapping(
     if not isinstance(unflat_indices, tuple):
       unflat_indices = (unflat_indices,)
     unflat_indices = list(unflat_indices)
-    if dim is not batching.not_mapped:
+    if dim is not None:
       unflat_indices.insert(dim, new_idx)
     return tuple(unflat_indices)
   idx_avals = [pallas_core.index_map_grid_aval, *block_mapping.index_map_jaxpr.in_avals]
@@ -377,7 +371,7 @@ def _batch_block_mapping(
         idx_avals)
   new_index_map_out_tree = out_tree_thunk()
   shape = block_mapping.block_shape
-  if dim is batching.not_mapped:
+  if dim is None:
     new_block_shape = shape
     new_array_aval = block_mapping.array_aval
   else:
@@ -419,7 +413,7 @@ def _broadcast_input_output_aliases(
   for input_index, _ in input_output_aliases:
     dim = dims_[input_index]
     dims_[input_index] = 0
-    if dim is batching.not_mapped:
+    if dim is None:
       args_[input_index] = batching.broadcast(
           args_[input_index], axis_size, 0, None)
     elif dim != 0:
@@ -463,7 +457,7 @@ def _batch_with_explicit_loop(
   (axis_size,) = {
       arg.shape[dim]
       for arg, dim in zip(args, dims)
-      if dim is not batching.not_mapped
+      if dim is not None
   }
 
   args, dims = _broadcast_input_output_aliases(
@@ -488,7 +482,7 @@ def _batch_with_explicit_loop(
     for arg, dim in zip(args, dims):
       # If the argument is mapped, extract a slice of size 1 in the mapped
       # dimension at the current index.
-      if dim is batching.not_mapped:
+      if dim is None:
         batch_args.append(arg)
       else:
         batch_args.append(
@@ -572,7 +566,7 @@ def _pallas_call_batching_rule(
 
   def _maybe_squeeze_out_bdim(x: jax_typing.Array, bdim: int | batching.NotMapped
                               ) -> jax_typing.Array:
-    return x if bdim is batching.not_mapped else jnp.squeeze(x, axis=bdim)
+    return x if bdim is None else jnp.squeeze(x, axis=bdim)
 
   # this is the _global_ axis size if axis_data.explicit_mesh_axis is not None
   # we want to convert it to the local axis size
@@ -621,13 +615,13 @@ def _pallas_call_batching_rule(
       dims, [grid_mapping.num_dynamic_grid_bounds]
   )
   if all(
-      bdim is batching.not_mapped or arg.shape[bdim] == 1
+      bdim is None or arg.shape[bdim] == 1
       for arg, bdim in zip(dynamic_grid_args, dynamic_grid_dims)
   ):
     dynamic_grid_args = safe_map(
         _maybe_squeeze_out_bdim, dynamic_grid_args, dynamic_grid_dims
     )
-  elif any(bdim is not batching.not_mapped for bdim in dynamic_grid_dims):
+  elif any(bdim is not None for bdim in dynamic_grid_dims):
     # TODO(amagni, sharadmv): Explore possibility of batching dynamic grid
     # bounds.
     if ema:
@@ -658,11 +652,11 @@ def _pallas_call_batching_rule(
     # vmapping over 1-sized dimensions, we can just get rid of the dimensions
     # and pretend we were never vmapped over them at all.
     if all(
-        bdim is batching.not_mapped or arg.shape[bdim] == 1
+        bdim is None or arg.shape[bdim] == 1
         for arg, bdim in zip(scalar_args, scalar_bdims)
     ):
       scalar_args = safe_map(_maybe_squeeze_out_bdim, scalar_args, scalar_bdims)
-      scalar_bdims = [batching.not_mapped] * len(scalar_args)
+      scalar_bdims = [None] * len(scalar_args)
       args = (*scalar_args, *args)
       dims = (*scalar_bdims, *bdims)
     else:
@@ -794,260 +788,13 @@ def _pallas_call_batching_rule(
 batching.fancy_primitive_batchers[pallas_call_p] = _pallas_call_batching_rule
 
 
-def checkify_pallas_kernel_body_jaxpr(
-    body_jaxpr: jax_core.ClosedJaxpr,
-    enabled_errors,
-    error: checkify.Error,
-    grid_mapping: GridMapping) -> tuple[
-        jax_core.ClosedJaxpr, tree_util.PyTreeDef, set[checkify.ErrorEffect]]:
-  err_vals, err_tree = tree_util.tree_flatten(error)
-  err_vals = map(jax_core.typeof, err_vals)
-  flat_err_and_in_vals = [*err_vals, *body_jaxpr.in_avals]
+def _pallas_call_dce_rule(
+    used_outs: list[bool], eqn: pe.JaxprEqn
+) -> tuple[list[bool], pe.JaxprEqn | None]:
+  del used_outs
+  return [True] * len(eqn.invars), eqn
 
-  with pallas_core.tracing_grid_env(grid_mapping.grid, ()):
-    checked_jaxpr, out_tree, error_effects = checkify.jaxpr_to_checkify_jaxpr(
-        body_jaxpr, enabled_errors, err_tree, *flat_err_and_in_vals)
-  return checked_jaxpr, out_tree, error_effects
-
-def pallas_call_checkify_oob_grid(error: checkify.Error,
-                                  enabled_errors,
-                                  args: jax_core.Value,
-                                  grid_mapping: GridMapping,
-                                  input_output_aliases) -> checkify.Error:
-  if checkify.OOBError not in enabled_errors:
-    return error
-  dynamic_grid_args, args = split_list(
-      args, [grid_mapping.num_dynamic_grid_bounds]
-  )
-  output_args = hlo_interpreter._initialize_output_vals(grid_mapping.block_mappings_output,
-                                    args, input_output_aliases)
-  scalars, input_args, _ = split_list(
-      args, [grid_mapping.num_index_operands,
-             grid_mapping.num_inputs],
-  )
-  dynamic_grid_args_iter = iter(dynamic_grid_args)
-  grid = tuple(
-      a if a is not pallas_core.dynamic_grid_dim
-      else next(dynamic_grid_args_iter)
-      for a in grid_mapping.grid
-  )
-  grid_start_indices = (jnp.int32(0),) * len(grid)
-  if grid:
-    num_iterations = reduce(jnp.multiply, grid)  # pyrefly: ignore[bad-argument-type]
-  else:
-    # Base case is always one iteration when grid is ()
-    num_iterations = 1
-
-  is_indexing_dim = [
-      tuple(isinstance(b, pallas_core.Squeezed) for b in bm.block_shape)
-      for bm in grid_mapping.block_mappings
-  ]
-  block_shapes = [
-      pallas_core._get_block_shape(bm.block_shape)
-      for bm in grid_mapping.block_mappings
-  ]
-  # The scan carry: (i, loop_idx, *consts, *ins, *outs, *scratch)
-  # i:int32 is the iteration index
-  # loop_idx: tuple[int32] are the program ids for each grid axis
-  def cond(carry):
-    i, *_ = carry
-    return i < num_iterations
-  def body(carry):
-    i, loop_idx, blocks = carry
-    if grid_mapping.local_grid_env is not None:
-      local_grid_env = grid_mapping.local_grid_env(loop_idx, grid)
-    else:
-      local_grid_env = tuple(
-          pallas_core.GridAxis(idx, b)  # pyrefly: ignore[bad-argument-type]
-          for dim, (idx, b) in enumerate(zip(loop_idx, grid))
-          if dim not in grid_mapping.vmapped_dims
-      )
-    with pallas_core.grid_env(local_grid_env):
-      start_indices = [
-          None if bm is None else bm.compute_start_indices_interpret(loop_idx, *scalars)
-          for bm in grid_mapping.block_mappings]
-    # We perform a dynamic slice on the i/o blocks, which will be checked by
-    # checkify for OOB accesses.
-    blocks = map(hlo_interpreter._dynamic_slice, start_indices, block_shapes,
-        [*input_args, *output_args], is_indexing_dim)
-    return (i + 1, hlo_interpreter._get_next_indices(grid, loop_idx), blocks)
-  def f(_):
-    return lax.while_loop(
-        cond, body, (jnp.int32(0), grid_start_indices, [jnp.zeros(shape) for shape in block_shapes])
-    )
-  flat_args, jaxpr_in_tree = tree_util.tree_flatten((jnp.int32(0),))
-  wrapped_loop, _ = api_util.flatten_fun_nokwargs(
-      lu.wrap_init(f,
-                   debug_info=api_util.debug_info("checkify oob_grid_access",
-                                                  f, (0,), {})),
-      jaxpr_in_tree)
-  with pallas_core.tracing_grid_env(grid_mapping.grid, ()):
-    avals_in = map(jax_core.typeof, flat_args)
-    traced_loop, _, consts = pe.trace_to_jaxpr_dynamic(
-        wrapped_loop, list(avals_in))
-    traced_loop = jax_core.ClosedJaxpr(traced_loop, consts)
-  out_error, _ = checkify.checkify_jaxpr(
-      traced_loop, checkify.index_checks, error, flat_args)
-  return out_error
-
-def pallas_call_checkify_rule(error: checkify.Error,
-                              enabled_errors,
-                              *args: jax_core.Value,
-                              jaxpr: jax_core.Jaxpr,
-                              interpret: Any,
-                              input_output_aliases: tuple[tuple[int, int], ...],
-                              grid_mapping: GridMapping,
-                              out_avals: tuple[jax_core.AbstractValue, ...],
-                              **kwargs):
-  # Check for OOB accesses in the grid.
-  error = pallas_call_checkify_oob_grid(error, enabled_errors,
-                                        args, grid_mapping,
-                                        input_output_aliases)
-  # We implement the checkify rule in 4 steps:
-  # 1) First, trace the kernel body to get the expected error shapes.
-  # 2) Checkify the kernel body to obtain a jaxpr with errors as inputs
-  #   and outputs.
-  # 3) Create a new kernel which stores the errors in output memrefs instead of
-  #   returning them, since pallas kernels do not return outputs.
-  # 4) Create block specs for the error state and call pallas_call with
-  #   the new kernel.
-  dynamic_grid_bounds, scalars, args = split_list(  # pyrefly: ignore[bad-assignment]
-      args, [grid_mapping.num_dynamic_grid_bounds,
-             grid_mapping.num_index_operands]
-  )
-  num_scalars = len(scalars)
-  num_kernel_inputs = len(args)
-  num_kernel_outputs = grid_mapping.num_outputs
-
-  # Trace the jaxpr to get an initial error value so the kernel jaxpr has all of
-  # the required inputs.
-  closed_jaxpr = pe.close_jaxpr(jaxpr)
-  _jaxpr, _, error_effects = checkify_pallas_kernel_body_jaxpr(
-      closed_jaxpr, enabled_errors, error, grid_mapping)
-  error = error._add_placeholder_effects(error_effects)
-  err_vals, err_in_tree = tree_util.tree_flatten(error)
-  shaped_err_avals = map(jax_core.typeof, err_vals)
-
-  # Trace the kernel jaxpr to get a checkified jaxpr. This jaxpr will have
-  # all enabled errors removed, but have the error as inputs and return values.
-  input_avals = [v.aval for v in jaxpr.invars]
-  num_err_vals = len(err_vals)
-  shaped_input_avals = tuple(input_avals)
-  checkify_in_avals = [*shaped_err_avals,
-                       *shaped_input_avals]
-  closed_kernel_jaxpr = pe.close_jaxpr(jaxpr)
-  with pallas_core.tracing_grid_env(grid_mapping.grid, ()):
-    checked_jaxpr, error_out_tree, _ = checkify.jaxpr_to_checkify_jaxpr(
-        closed_kernel_jaxpr, enabled_errors, err_in_tree, *checkify_in_avals)
-
-  # Create a new kernel to remove the error as an return value and instead
-  # write them to a memref. This is because pallas kernels are expected
-  # to have no return values but instead write their outputs to a ref.
-  def checked_kernel_fn(*args):
-    (scalars, in_error_refs, inputs, out_error_refs, outputs, scratch
-     ) = split_list(
-        args,
-        [num_scalars, num_err_vals,
-         num_kernel_inputs, num_err_vals, num_kernel_outputs])
-    # TODO(b/350593266): Remove zero-indexing once we support ()-shaped scalars.
-    input_error_vals = [err_ref[0, 0] for err_ref in in_error_refs]
-    # We need to re-order the inputs here. A checkified jaxpr always expects
-    # errors before other arguments.
-    jaxpr_args = [*input_error_vals, *scalars, *inputs, *outputs, *scratch]
-    assert len(checked_jaxpr.jaxpr.invars) == len(jaxpr_args)
-    result_flat = jax_core.eval_jaxpr(
-        checked_jaxpr.jaxpr, checked_jaxpr.consts, *jaxpr_args)
-    output_errors, _ = split_list(result_flat, [num_err_vals])
-    # Store new errors back in the error refs.
-    for in_ref, out_ref, error in zip(
-        in_error_refs, out_error_refs, output_errors):
-      in_ref[0, 0] = error
-      out_ref[0, 0] = error
-    return []
-
-  # Trace the new checked_kernel_fn with Memref inputs so that
-  # we can replace the old kernel jaxpr with the new checked jaxpr in
-  # pallas_call.
-
-  # ensure_2d_shape is only necessary because pallas does not support
-  # ()-shaped Memrefs.
-  # TODO(b/350593266): Remove once we support ()-shaped scalars.
-  def _ensure_2d_error_shape(arg):
-    if isinstance(arg, jax_core.ShapedArray):
-      dtype = arg.dtype
-      return jax_core.ShapedArray((1, 1) + arg.shape, dtype=dtype,
-                                  weak_type=arg.weak_type)
-    elif isinstance(arg, jax_typing.Array):
-      return jnp.reshape(arg, (1, 1) + arg.shape)
-    else:
-      return jnp.array([[arg]])
-  shaped_err_avals = map(_ensure_2d_error_shape, shaped_err_avals)
-  err_vals = map(_ensure_2d_error_shape, err_vals)
-
-  error_memref_aval = [state.AbstractRef(
-      err_val, pallas_core.MemorySpace.ERROR) for err_val in shaped_err_avals]
-  shaped_scalar_avals, input_aval, output_aval, scratch_aval = split_list(
-      shaped_input_avals, [num_scalars, num_kernel_inputs, num_kernel_outputs])
-  retrace_in_avals = [*shaped_scalar_avals, *error_memref_aval, *input_aval,
-                      *error_memref_aval, *output_aval, *scratch_aval]
-  jaxpr_flat_avals, jaxpr_in_tree = tree_util.tree_flatten(retrace_in_avals)
-  debug_info = api_util.debug_info("checkify_pallas", checked_kernel_fn,
-                              retrace_in_avals, {})
-  wrapped_kernel_with_err, out_tree_thunk = api_util.flatten_fun_nokwargs(
-      lu.wrap_init(checked_kernel_fn, debug_info=debug_info), jaxpr_in_tree)
-
-  with pallas_core.tracing_grid_env(grid_mapping.grid, ()):
-    final_jaxpr, _, _ = pe.trace_to_jaxpr_dynamic(
-        wrapped_kernel_with_err, jaxpr_flat_avals)
-
-  # Prepare pallas_call inputs. We need to create new block specs
-  # for the new error inputs and outputs.
-  error_block_specs = [pallas_core.BlockSpec(None, None)] * len(shaped_err_avals)
-  error_paths, _ = unzip2(tree_util.tree_flatten_with_path(error_block_specs)[0])
-  error_origins = tuple(f"errors[{tree_util.keystr(p)}" for p in error_paths)
-  error_block_mappings = map(
-      partial(
-          pallas_core._convert_block_spec_to_block_mapping,
-          index_map_avals=grid_mapping.index_map_avals,
-          index_map_tree=grid_mapping.index_map_tree,
-          grid=grid_mapping.grid,
-          vmapped_dims=grid_mapping.vmapped_dims,
-          debug=True,
-      ),
-      error_block_specs,
-      error_origins,
-      shaped_err_avals,
-  )
-  input_block_mappings, output_block_mappings = split_list(
-      grid_mapping.block_mappings, [num_kernel_inputs,])
-  grid_mapping_with_error = grid_mapping.replace(
-      block_mappings=(*error_block_mappings, *input_block_mappings,
-                      *error_block_mappings, *output_block_mappings),
-      num_inputs=grid_mapping.num_inputs + len(error_block_mappings),
-      num_outputs=grid_mapping.num_outputs + len(error_block_mappings)
-  )
-  # Bump all input_output_aliases by num_err_vals to make room for error
-  # TODO(justinfu): Don't bump scalars here.
-  input_output_aliases = tuple(
-      (i+num_err_vals, o+num_err_vals) for (i, o) in input_output_aliases)
-  input_output_aliases_with_error = tuple(
-      (i+num_scalars, i) for i in range(num_err_vals)) + input_output_aliases
-
-  new_vals_in = [*scalars, *err_vals, *args]
-  new_out_avals = (*shaped_err_avals, *out_avals)
-  result = pallas_call_p.bind(*dynamic_grid_bounds, *new_vals_in,
-    jaxpr=final_jaxpr,
-    interpret=interpret,
-    grid_mapping=grid_mapping_with_error,
-    input_output_aliases=input_output_aliases_with_error,
-    out_avals=new_out_avals,
-    **kwargs)
-  errors, results = split_list(result, [num_err_vals])
-  # TODO(b/350593266): Remove line below once we support ()-shaped scalars.
-  errors = [err_val[0, 0] for err_val in errors]
-  new_error, _ = tree_util.tree_unflatten(error_out_tree, errors)
-  return new_error, results
-checkify.error_checks[pallas_call_p] = pallas_call_checkify_rule
+pe.dce_rules[pallas_call_p] = _pallas_call_dce_rule
 
 
 def _trace_kernel_to_jaxpr(
@@ -1096,16 +843,6 @@ def _trace_kernel_to_jaxpr(
   return jaxpr, tuple(consts)
 
 
-_PALLAS_USE_MOSAIC_GPU = config.bool_state(
-    "jax_pallas_use_mosaic_gpu",
-    default=config.bool_env("JAX_PALLAS_USE_MOSAIC_GPU", True),
-    help=(
-        "If True, lower Pallas kernels to the experimental Mosaic GPU"
-        " dialect, instead of Triton IR."
-    ),
-)
-
-
 def _unsupported_lowering_error(platform: str) -> Exception:
   return ValueError(
       f"Cannot lower pallas_call on platform: {platform}. To use Pallas on GPU,"
@@ -1120,16 +857,34 @@ def _pallas_call_lowering(
   if params['jaxpr'].constvars:
     raise ValueError('Cannot lower a pallas_call with constants.')
   if interpret:
-    if isinstance(interpret, InterpretParams):
-      impl = partial(mosaic_tpu_interpret.interpret_pallas_call,  # pyrefly: ignore[missing-attribute]
-                     interpret_params=interpret,
-                     **params)
-    elif isinstance(interpret, InterpretGPUParams):
-      impl = partial(mosaic_gpu_interpret.interpret_pallas_call,  # pyrefly: ignore[missing-attribute]
-                     interpret_params=interpret,
-                     **params)
+    impl = partial(hlo_interpreter.pallas_call_hlo_interpret, **params)
+
+    try:
+      from jax._src.pallas.mosaic.interpret import interpret_pallas_call as mosaic_tpu_interpret  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.mosaic.interpret import params as tpu_params  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
     else:
-      impl = partial(hlo_interpreter.pallas_call_hlo_interpret, **params)
+      if isinstance(interpret, tpu_params.InterpretParams):
+        impl = partial(
+            mosaic_tpu_interpret.interpret_pallas_call,
+            interpret_params=interpret,
+            **params,
+        )
+
+    try:
+      from jax._src.pallas.mosaic_gpu.interpret import interpret_pallas_call as mosaic_gpu_interpret  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.mosaic_gpu.interpret import params as gpu_params  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
+    else:
+      if isinstance(interpret, gpu_params.InterpretGPUParams):
+        impl = partial(
+            mosaic_gpu_interpret.interpret_pallas_call,
+            interpret_params=interpret,
+            **params,
+        )
+
     return mlir.lower_fun(impl, multiple_results=True)(ctx, *in_nodes)
 
   def cpu_lowering(
@@ -1150,8 +905,11 @@ def _pallas_call_lowering(
       if rule is not None:
         return rule(ctx, *in_nodes, **params)
 
-    if mosaic_tpu_backend is None:
-      raise _unsupported_lowering_error("tpu")
+    try:
+      from jax._src.pallas.mosaic import pallas_call_registration as mosaic_tpu_backend  # pyrefly: ignore[missing-import]
+    except ImportError:
+      raise _unsupported_lowering_error("tpu") from None
+
     return mosaic_tpu_backend.pallas_call_tpu_lowering_rule(
         ctx, *in_nodes, **params
     )
@@ -1170,29 +928,51 @@ def _pallas_call_lowering(
         return rule(ctx, *in_nodes, compiler_params=compiler_params, **params)
 
     backend: Any = None
-    if mosaic_gpu_backend is not None:
-      from jax._src.pallas.mosaic_gpu import core as mgpu_core
+
+    try:
+      from jax._src.pallas.mosaic_gpu import core as mgpu_core  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.mosaic_gpu import pallas_call_registration as mosaic_gpu_backend  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
+    else:
       if (
           isinstance(compiler_params, mgpu_core.CompilerParams)
-          or (compiler_params is None and _PALLAS_USE_MOSAIC_GPU.value)
+          or (compiler_params is None and
+              config.jax_pallas_use_mosaic_gpu.value)
       ):
         backend = mosaic_gpu_backend
-    if triton_backend is not None:
-      from jax._src.pallas.triton import core as triton_core
+
+      if backend is mosaic_gpu_backend:
+        if is_rocm:
+          raise ValueError(
+              "Mosaic GPU does not yet support AMD ROCm devices. "
+              "Use ``compiler_params=pltriton.CompilerParams()`` for ROCm."
+          )
+
+        if ctx.primitive is pallas_call_p:
+          deprecations.warn(
+              "jax-pallas-call-mgpu",
+              "Using ``pl.pallas_call`` for Mosaic GPU kernels is deprecated."
+              " Support for that will be removed in a future JAX version."
+              " Please migrate to ``plgpu.kernel``.",
+              stacklevel=2,
+          )
+
+    try:
+      from jax._src.pallas.triton import core as triton_core  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.triton import pallas_call_registration as triton_backend  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
+    else:
       if (
           isinstance(compiler_params, triton_core.CompilerParams)
-          or (compiler_params is None and not _PALLAS_USE_MOSAIC_GPU.value)
+          or (compiler_params is None and
+              not config.jax_pallas_use_mosaic_gpu.value)
       ):
         backend = triton_backend
 
     if backend is None:
       raise _unsupported_lowering_error("gpu")
-
-    if is_rocm and backend is mosaic_gpu_backend:
-      raise ValueError(
-          "Mosaic GPU does not yet support AMD ROCm devices. "
-          "Use ``compiler_params=pltriton.CompilerParams()`` for ROCm."
-      )
 
     return backend.pallas_call_lowering(
         ctx, *in_nodes, compiler_params=compiler_params, **params
@@ -1355,6 +1135,7 @@ def _pallas_call_state_discharge_rule(
   return updated_vals_in, rest
 
 
+@partial(api_boundary, repro_api_name="jax.experimental.pallas.pallas_call")
 def pallas_call(
     kernel: Callable[..., None],
     out_shape: Any,
@@ -1464,7 +1245,6 @@ def pallas_call(
   )
 
 
-@partial(api_boundary, repro_api_name="jax.experimental.pallas.pallas_call")
 def _pallas_call(
     kernel: Callable[..., None],
     out_shape: Any,
@@ -1499,7 +1279,7 @@ def _pallas_call(
   flat_out_shapes_with_paths, out_tree = tree_util.tree_flatten_with_path(out_shape)
   out_paths, flat_out_shapes = unzip2(flat_out_shapes_with_paths)
 
-  @partial(api.jit, inline=True)
+  @api.jit(inline=True)
   def wrapped(*args):
     flat_args_with_paths, in_tree = tree_util.tree_flatten_with_path(args)
     in_paths, flat_args = unzip2(flat_args_with_paths)
@@ -1595,43 +1375,12 @@ def _pallas_call(
           cost_estimate=cost_estimate,
           metadata=FrozenDict(metadata) if metadata is not None else None,
           name=name,
+          # If we're running under GPU Interpret Mode, save the kernel arg
+          # transforms. Checks the string name to avoid a conditional import.
+          # TODO(jburnim): Clean this up.
+          **(dict(kernel_arg_transforms=kernel_arg_transforms)
+             if type(interpret).__name__ == "InterpretGPUParams" else {}),
       )
     out = tree_util.tree_unflatten(out_tree, out_flat)
     return out
   return wrapped
-
-
-# We import the TPU backend at the top level because it defines flags. Note that
-# we can only do that at the bottom of this file, because it also depends on
-# this module already being initialized.
-
-try:
-  from jax._src.pallas.mosaic import pallas_call_registration as mosaic_tpu_backend
-except ImportError:
-  mosaic_tpu_backend = None
-
-
-try:
-  from jax._src.pallas.mosaic_gpu import pallas_call_registration as mosaic_gpu_backend
-except ImportError:
-  mosaic_gpu_backend = None
-
-
-try:
-  from jax._src.pallas.triton import pallas_call_registration as triton_backend
-except ImportError:
-  triton_backend = None
-
-try:
-  from jax._src.pallas.mosaic.interpret import interpret_pallas_call as mosaic_tpu_interpret
-  from jax._src.pallas.mosaic.interpret.params import InterpretParams
-except ImportError:
-  mosaic_tpu_interpret = None
-  InterpretParams = types.new_class("_NoInstances", (enum.Enum,))
-
-try:
-  from jax._src.pallas.mosaic_gpu.interpret import interpret_pallas_call as mosaic_gpu_interpret
-  from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
-except ImportError:
-  mosaic_gpu_interpret = None
-  InterpretGPUParams = types.new_class("_NoInstances", (enum.Enum,))

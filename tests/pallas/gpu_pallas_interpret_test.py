@@ -101,9 +101,10 @@ class InterpretTest(jtu.JaxTestCase):
 
   @jtu.parameterized.parameters(range(1, 17))
   def test_interpret_kernel(self, num_threads):
+
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((num_threads,), jnp.int32),
+        out_type=jax.ShapeDtypeStruct((num_threads,), jnp.int32),
         num_threads=num_threads,
         thread_name='x',
         interpret=InterpretParams(detect_races=True),
@@ -114,6 +115,74 @@ class InterpretTest(jtu.JaxTestCase):
 
     np.testing.assert_equal(jax.jit(_kernel)(), np.arange(num_threads))
     self.assertFalse(mosaic_interpret.get_races().races_found)
+
+  def test_tiling_and_swizzle_transforms(self):
+
+    @jax.jit
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((128, 128), jnp.float16),
+        scratch_types=dict(
+            smem_ref1=plgpu.SMEM(
+                (2, 128, 128),
+                jnp.float16,
+                transforms=(
+                    plgpu.TilingTransform((8, 64)),
+                    plgpu.SwizzleTransform(128),
+                ),
+            ),
+            smem_ref2=plgpu.SMEM(
+                (4, 128, 32),
+                jnp.float16,
+                transforms=(plgpu.SwizzleTransform(64),),
+            ),
+            smem_ref3=plgpu.SMEM(
+                (256, 128),
+                jnp.float16,
+                transforms=(plgpu.TilingTransform((16, 32)),),
+            ),
+        ),
+        interpret=InterpretParams(),
+    )
+    def kernel(o_ref, smem_ref1, smem_ref2, smem_ref3):
+      smem_ref1[...] = jnp.full_like(smem_ref1, 42.0)
+      smem_ref2[...] = jnp.full_like(smem_ref2, 1.0)
+      smem_ref3[...] = jnp.full_like(smem_ref3, 2.0)
+      o_ref[...] = (smem_ref1[0, ...] + smem_ref2[...].reshape((128, 128))
+                    + smem_ref3[:128])
+
+    np.testing.assert_equal(kernel(), np.full((128, 128), 45.0, jnp.float16))
+
+  def test_tiling_and_swizzle_transforms_with_pallas_call(self):
+    def _kernel(o_ref, smem_ref1, smem_ref2, smem_ref3):
+      smem_ref1[...] = jnp.full_like(smem_ref1, 42.0)
+      smem_ref2[...] = jnp.full_like(smem_ref2, 1.0)
+      smem_ref3[...] = jnp.full_like(smem_ref3, 2.0)
+      o_ref[...] = (smem_ref1[0, ...] + smem_ref2[...].reshape((128, 128))
+                    + smem_ref3[:128])
+
+    @jax.jit
+    def run():
+      return pl.pallas_call(
+          _kernel,
+          out_shape=jax.ShapeDtypeStruct((128, 128), jnp.float16),
+          out_specs=plgpu.BlockSpec((128, 128), memory_space=plgpu.SMEM),
+          scratch_shapes=dict(
+              smem_ref1=plgpu.SMEM((2, 128, 128), jnp.float16, transforms=(
+                  plgpu.TilingTransform((8, 64)),
+                  plgpu.SwizzleTransform(128),
+              )),
+              smem_ref2=plgpu.SMEM((4, 128, 32), jnp.float16, transforms=(
+                  plgpu.SwizzleTransform(64),
+              )),
+              smem_ref3=plgpu.SMEM((256, 128), jnp.float16, transforms=(
+                  plgpu.TilingTransform((16, 32)),
+              )),
+          ),
+          interpret=InterpretParams(),
+      )()
+
+    np.testing.assert_equal(run(), np.full((128, 128), 45.0, jnp.float16))
 
   def test_skip_floating_point_ops(self):
     def matmul_kernel(x_ref, y_ref, z_ref):
@@ -168,13 +237,7 @@ class InterpretTest(jtu.JaxTestCase):
 
       @functools.partial(
           plgpu.kernel,
-          out_shape=jax.ShapeDtypeStruct(
-              (
-                  x.shape[0],
-                  y.shape[1],
-              ),
-              x.dtype,
-          ),
+          out_type=jax.ShapeDtypeStruct((x.shape[0], y.shape[1]), x.dtype),
           num_threads=num_threads,
           thread_name='t',
           interpret=InterpretParams(
@@ -209,8 +272,7 @@ class InterpretTest(jtu.JaxTestCase):
     np.testing.assert_allclose(z, x @ y, atol=1e-3)
     self.assertFalse(mosaic_interpret.get_races().races_found)
 
-  @jtu.parameterized.parameters(False, True)
-  def test_run_scoped(self, with_race):
+  def test_run_scoped(self):
     mesh = plgpu.Mesh(num_threads=2, thread_name='n')
 
     @jax.jit
@@ -219,7 +281,9 @@ class InterpretTest(jtu.JaxTestCase):
 
         @pl.core_map(
             mesh,
-            interpret=InterpretParams(detect_races=True),
+            interpret=InterpretParams(
+                detect_races=True,
+            ),
         )
         def _():
           def body(ref):
@@ -236,23 +300,202 @@ class InterpretTest(jtu.JaxTestCase):
           pl.run_scoped(
               body,
               plgpu.GMEM(o_ref.shape[1:], dtype=o_ref.dtype),
-              collective_axes=('n',) if with_race else (),
+              collective_axes=('n',),
           )
 
       y = pl.run_state(inner)(x)
       return y
 
-    y = f(jnp.zeros((2, 16, 128)))
+    _ = f(jnp.zeros((2, 16, 128)))
+    self.assertTrue(mosaic_interpret.get_races().races_found)
 
-    if with_race:
-      # Due to the presence of a race, we cannot expect `y` to have a
-      # well-defined value. Hence, we do not assert anything about `y`.
-      self.assertTrue(mosaic_interpret.get_races().races_found)
+  @jtu.parameterized.parameters(
+      ((),),
+      (('t',),),
+      (('c0',),),
+      (('c1',),),
+      (('c0', 't'),),
+      (('c1', 't'),),
+      (('c0', 'c1'),),
+      (('c0', 'c1', 't'),),
+  )
+  def test_run_scoped_with_cluster(self, collective_axes):
+    all_axis_names = ('c0', 'c1', 't')
+    non_collective_axis_names = tuple(
+        name for name in all_axis_names if name not in collective_axes
+    )
+
+    mesh = plgpu.Mesh(
+        cluster=(2, 2),
+        cluster_names=('c0', 'c1'),
+        num_threads=2,
+        thread_name='t',
+    )
+
+    @jax.jit
+    def f(x):
+      def inner(o_ref):
+
+        @pl.core_map(
+            mesh,
+            interpret=InterpretParams(
+                detect_races=True,
+            ),
+        )  # type: ignore[wrong-arg-types]
+        def _():
+          def body(ref):
+            collective_indices = tuple(
+                jax.lax.axis_index(axis_name) for axis_name in collective_axes
+            )
+            non_collective_indices = tuple(
+                jax.lax.axis_index(axis_name)
+                for axis_name in non_collective_axis_names
+            )
+
+            ref[collective_indices] = sum(
+                stride * index
+                for stride, index in zip(
+                    (1, 2, 4), reversed(collective_indices)
+                )
+            )
+
+            o_ref[non_collective_indices + collective_indices] = ref[
+                collective_indices
+            ]
+
+          pl.run_scoped(
+              body,
+              plgpu.GMEM((2,) * len(collective_axes), dtype=jnp.int32),
+              collective_axes=collective_axes,
+          )
+
+      y = pl.run_state(inner)(x)
+      return y
+
+    if 'c0' in collective_axes or 'c1' in collective_axes:
+      with self.assertRaisesRegex(
+          Exception,
+          r'Collective allocations along cluster axes are not' r' supported\.',
+      ):
+        _ = f(jnp.zeros((2, 2, 2), dtype=jnp.int32))
+      mosaic_interpret.reset_gpu_interpret_mode_state()
+    elif 't' not in collective_axes:
+      with self.assertRaisesRegex(
+          Exception,
+          r'Scoped allocation must have the thread axis in its collective'
+          r' axes\.',
+      ):
+        _ = f(jnp.zeros((2, 2, 2), dtype=jnp.int32))
+      mosaic_interpret.reset_gpu_interpret_mode_state()
     else:
-      np.testing.assert_array_equal(
-          y, np.broadcast_to(np.arange(2).reshape(2, 1, 1), y.shape)
-      )
+      y = f(jnp.zeros((2, 2, 2), dtype=jnp.int32))
       self.assertFalse(mosaic_interpret.get_races().races_found)
+      expected = np.arange(2 ** len(collective_axes)).reshape(
+          (1,) * len(non_collective_axis_names) + (2,) * len(collective_axes)
+      )
+      expected = np.broadcast_to(expected, (2, 2, 2))
+      np.testing.assert_array_equal(y, expected)
+
+  def test_run_scoped_with_unknown_collective_axis(self):
+    mesh = plgpu.Mesh(
+        cluster=(2, 2),
+        cluster_names=('c0', 'c1'),
+        num_threads=2,
+        thread_name='t',
+    )
+
+    @jax.jit
+    def f(x):
+      def inner(o_ref):
+
+        @pl.core_map(
+            mesh,
+            interpret=InterpretParams(),
+        )
+        def _():
+          def body(_):
+            o_ref[...] = 42
+
+          pl.run_scoped(
+              body,
+              plgpu.GMEM((), dtype=jnp.int32),
+              collective_axes=('unknown_axis',),
+          )
+      y = pl.run_state(inner)(x)
+      return y
+
+    with self.assertRaisesRegex(
+        Exception,
+        r"Collective axis `unknown_axis` not found among axes `\['c0', 'c1', 't'\]`",
+    ):
+      _ = f(jnp.zeros((), dtype=jnp.int32))
+    mosaic_interpret.reset_gpu_interpret_mode_state()
+
+  @jtu.parameterized.parameters(
+      (
+          True,
+          ('c0',),
+          r'Collective allocations along cluster axes are not'
+          r' supported\.',
+      ),
+      (
+          True,
+          ('c0', 't'),
+          r'Collective allocations along cluster axes are not'
+          r' supported\.',
+      ),
+      (
+          True,
+          (),
+          (
+              r'Scoped allocation must have the thread axis in its collective'
+              r' axes\.'
+          ),
+      ),
+      (
+          False,
+          ('c0',),
+          r'Requesting collective allocations, but no explicit thread axis'
+          r' specified\.',
+      ),
+      (False, ('t',), r'Collective axis `t` not found among axes'),
+  )
+  def test_run_scoped_barrier_with_incorrect_collective_axes(
+      self, has_thread_axis, collective_axes, expected_error_regex
+  ):
+    mesh_kwargs = dict(
+        cluster=(2, 2),
+        cluster_names=('c0', 'c1'),
+    )
+    if has_thread_axis:
+      mesh_kwargs.update(
+          num_threads=2,
+          thread_name='t',
+      )
+    mesh = plgpu.Mesh(**mesh_kwargs)
+
+    @jax.jit
+    def f(x):
+      def inner(o_ref):
+        @pl.core_map(
+            mesh,
+            interpret=InterpretParams(),
+        )
+        def _():
+          def body(_):
+            o_ref[...] = 42
+
+          pl.run_scoped(
+              body,
+              plgpu.Barrier(),
+              collective_axes=collective_axes,
+          )
+      y = pl.run_state(inner)(x)
+      return y
+
+    with self.assertRaisesRegex(Exception, expected_error_regex):
+      _ = f(jnp.zeros((), dtype=jnp.int32))
+    mosaic_interpret.reset_gpu_interpret_mode_state()
 
   # Test adapted from
   # https://docs.jax.dev/en/latest/pallas/gpu/reference.html#using-multiple-pallas-threads-per-cuda-block
@@ -261,8 +504,8 @@ class InterpretTest(jtu.JaxTestCase):
 
     @functools.partial(
         plgpu.kernel,
-        out_shape=x,
-        scratch_shapes=dict(
+        out_type=x,
+        scratch_types=dict(
             smem_ref=plgpu.SMEM(x.shape, x.dtype),
             barrier_ref=plgpu.Barrier(),
         ),
@@ -292,8 +535,8 @@ class InterpretTest(jtu.JaxTestCase):
 
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=dict(
             smem_ref=plgpu.SMEM((num_threads - 1,), jnp.int32),
             barrier_ref=plgpu.Barrier(
                 num_arrivals=num_threads - 1, num_barriers=1
@@ -324,8 +567,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_multiple_barriers_with_single_arrival(self, num_threads):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=dict(
             smem_ref=plgpu.SMEM((num_threads - 1,), jnp.int32),
             barrier_ref=plgpu.Barrier(
                 num_arrivals=1, num_barriers=num_threads - 1
@@ -372,8 +615,8 @@ class InterpretTest(jtu.JaxTestCase):
 
     @functools.partial(
         plgpu.kernel,
-        out_shape=x,
-        scratch_shapes=dict(
+        out_type=x,
+        scratch_types=dict(
             queue=plgpu.SMEM((buffer_size,), jnp.float32),
             produced=plgpu.Barrier(num_arrivals=1, num_barriers=buffer_size),
             consumed=plgpu.Barrier(num_arrivals=1, num_barriers=buffer_size),
@@ -381,7 +624,8 @@ class InterpretTest(jtu.JaxTestCase):
         num_threads=2,
         thread_name='t',
         interpret=InterpretParams(
-            detect_races=True, skip_floating_point_ops=skip_floating_point_ops
+            detect_races=True,
+            skip_floating_point_ops=skip_floating_point_ops,
         ),
     )
     def _kernel(x_ref, out_ref, queue, produced, consumed):
@@ -439,8 +683,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_indexing_singleton_barrier_ok(self):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=(plgpu.Barrier(),),
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=(plgpu.Barrier(),),
         num_threads=1,
         thread_name='t',
         interpret=InterpretParams(),
@@ -456,8 +700,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_not_indexing_multiple_barriers_raises(self):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=(plgpu.Barrier(num_barriers=2),),
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=(plgpu.Barrier(num_barriers=2),),
         num_threads=1,
         thread_name='t',
         interpret=InterpretParams(),
@@ -477,8 +721,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_wait_for_barrier_twice(self):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=dict(
             barrier_ref=plgpu.Barrier(num_arrivals=1, num_barriers=2)
         ),
         num_threads=3,
@@ -513,8 +757,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_completing_barrier_twice_in_same_thread_raises(self):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=dict(barrier_ref=plgpu.Barrier(num_arrivals=1)),
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=dict(barrier_ref=plgpu.Barrier(num_arrivals=1)),
         interpret=InterpretParams(),
     )
     def _kernel(out_ref, barrier_ref):
@@ -533,8 +777,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_completing_barrier_twice_in_different_threads_raises(self):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((2,), jnp.int32),
-        scratch_shapes=dict(barrier_ref=plgpu.Barrier(num_arrivals=1)),
+        out_type=jax.ShapeDtypeStruct((2,), jnp.int32),
+        scratch_types=dict(barrier_ref=plgpu.Barrier(num_arrivals=1)),
         interpret=InterpretParams(),
         num_threads=2,
         thread_name='t',
@@ -562,8 +806,8 @@ class InterpretTest(jtu.JaxTestCase):
   ):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((num_threads,), jnp.int32),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((num_threads,), jnp.int32),
+        scratch_types=dict(
             barrier_ref=plgpu.Barrier(
                 num_arrivals=num_arriving_threads, num_barriers=1
             )
@@ -590,8 +834,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_more_barrier_completions_than_waits_raises(self):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=dict(barrier_ref=plgpu.Barrier(num_arrivals=1)),
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=dict(barrier_ref=plgpu.Barrier(num_arrivals=1)),
         num_threads=2,
         thread_name='t',
         interpret=InterpretParams(),
@@ -620,8 +864,8 @@ class InterpretTest(jtu.JaxTestCase):
   def test_not_waiting_for_all_barrier_completions_in_thread_raises(self):
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=dict(
             barrier_ref=plgpu.Barrier(num_arrivals=1, num_barriers=2)
         ),
         num_threads=3,
@@ -688,7 +932,7 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct(a.shape, a.dtype),
+        out_type=jax.ShapeDtypeStruct.like(a),
         grid=(num_blocks_w, num_blocks_x, num_blocks_y),
         grid_names=('w', 'x', 'y'),
         num_threads=num_threads,
@@ -740,7 +984,7 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct((x, y, z), dtype),
+        out_type=jax.ShapeDtypeStruct((x, y, z), dtype),
         grid=_maybe_reverse((x_iters, y_iters), swap_grid_axes),
         grid_names=_maybe_reverse(('x', 'y'), swap_grid_axes),
         num_threads=z_iters,
@@ -813,8 +1057,8 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((m, n), dtype),
+        scratch_types=dict(
             acc_smem=plgpu.SMEM((tile_m, tile_n), dtype),
             barrier=plgpu.Barrier(num_barriers=k_iters),
         ),
@@ -867,8 +1111,8 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((m, n), dtype),
+        scratch_types=dict(
             acc_smem=plgpu.SMEM((tile_m, tile_n), dtype),
         ),
         grid=(m_iters, n_iters),
@@ -893,9 +1137,9 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_type=jax.ShapeDtypeStruct.like(x),
         interpret=InterpretParams(detect_races=True),
-        scratch_shapes=dict(
+        scratch_types=dict(
             barrier=plgpu.Barrier(), smem=plgpu.SMEM(x.shape, x.dtype)
         ),
     )
@@ -926,9 +1170,9 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_type=jax.ShapeDtypeStruct.like(x),
         interpret=InterpretParams(detect_races=True),
-        scratch_shapes=dict(
+        scratch_types=dict(
             barrier=plgpu.Barrier(),
             smem=plgpu.SMEM(x.shape, x.dtype),
         ),
@@ -963,9 +1207,9 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_type=jax.ShapeDtypeStruct.like(x),
         interpret=InterpretParams(detect_races=True),
-        scratch_shapes=dict(
+        scratch_types=dict(
             per_thread_barrier=plgpu.Barrier(num_barriers=2),
             smem0=plgpu.SMEM(x.shape, x.dtype),
             smem1=plgpu.SMEM(x.shape, x.dtype),
@@ -997,12 +1241,12 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_type=jax.ShapeDtypeStruct.like(x),
         interpret=InterpretParams(
             detect_races=True,
             num_tma_threads_per_device=num_tma_threads_per_device,
         ),
-        scratch_shapes=dict(
+        scratch_types=dict(
             barrier=plgpu.Barrier(num_barriers=2),
             smem=plgpu.SMEM(x.shape, x.dtype),
         ),
@@ -1034,9 +1278,9 @@ class InterpretTest(jtu.JaxTestCase):
 
     kernel = plgpu.kernel(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_type=jax.ShapeDtypeStruct.like(x),
         interpret=InterpretParams(detect_races=True),
-        scratch_shapes=dict(
+        scratch_types=dict(
             barrier=plgpu.Barrier(num_arrivals=2),
             smem0=plgpu.SMEM(x.shape, x.dtype),
             smem1=plgpu.SMEM(x.shape, x.dtype),
@@ -1076,7 +1320,7 @@ class InterpretTest(jtu.JaxTestCase):
 
       y = plgpu.kernel(
           kernel,
-          out_shape=jax.ShapeDtypeStruct((), jnp.int32),
+          out_type=jax.ShapeDtypeStruct((), jnp.int32),
           interpret=InterpretParams(detect_races=True),
       )()
 

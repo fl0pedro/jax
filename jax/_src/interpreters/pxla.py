@@ -50,7 +50,7 @@ from jax._src.abstract_arrays import array_types
 from jax._src.core import ShapedArray
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import mlir
-from jax._src.layout import Layout, AutoLayout, Format
+from jax._src.layout import Layout, AutoLayoutSingleton, Format
 from jax._src.lib import _jax
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
@@ -119,7 +119,11 @@ def shard_args(
   # indices to put each array back to its original position.
   results: list[typing.Array | None] = [None] * len(args)
   for t, (indices, a, s, l, xcs) in batches.items():
-    outs = shard_arg_handlers[t](a, s, l, xcs)
+    handler = shard_arg_handlers.get(t)
+    if handler is None:
+      raise dtypes.InvalidInputException(
+          f"Argument of type {t} is not a valid JAX type.")
+    outs = handler(a, s, l, xcs)
     for i, out in safe_zip(indices, outs):
       results[i] = out
   assert all(result is not None for result in results)
@@ -143,7 +147,7 @@ def is_default_layout(curr_layout, sharding, aval):
   if (aval is core.abstract_token or aval.dtype == dtypes.float0 or
       dtypes.issubdtype(aval.dtype, dtypes.extended)):
     return True
-  if isinstance(curr_layout, AutoLayout):
+  if isinstance(curr_layout, AutoLayoutSingleton):
     return False
   d = sharding._device_assignment[0]
   shard_shape = sharding.shard_shape(aval.shape)
@@ -251,7 +255,7 @@ def global_aval_to_result_handler(
     raise TypeError(
         f"No pxla_result_handler for type: {type(aval)}") from err
 
-PxlaResultHandler = Callable[..., xc._xla.ResultHandler]
+PxlaResultHandler = Callable[..., _jax.ResultHandler]
 global_result_handlers: dict[type[core.AbstractValue], PxlaResultHandler] = {}
 
 
@@ -411,19 +415,23 @@ class ExecuteReplicated:
       return out_
 
 
-def _axis_read(axis_env, axis_name):
+def _axis_read(axis_names, axis_name):
   try:
-    return max(i for i, name in enumerate(axis_env.names) if name == axis_name)
+    return max(i for i, name in enumerate(axis_names) if name == axis_name)
   except ValueError:
     raise NameError(f"unbound axis name: {axis_name}") from None
 
-def axis_groups(axis_env: sharding_impls.AxisEnv, name) -> tuple[tuple[int, ...]]:
+def axis_groups(axis_ctx, name) -> tuple[tuple[int, ...]]:
+  assert not isinstance(axis_ctx, sharding_impls.ShardingContext)
+  size = axis_ctx.mesh.size
+  axis_names = axis_ctx.mesh.axis_names
+  axis_sizes = axis_ctx.mesh.axis_sizes
   if not isinstance(name, (list, tuple)):
     name = (name,)
-  mesh_axes = tuple(unsafe_map(partial(_axis_read, axis_env), name))
-  trailing_size, ragged = divmod(axis_env.nreps, math.prod(axis_env.sizes))
+  mesh_axes = tuple(unsafe_map(partial(_axis_read, axis_names), name))
+  trailing_size, ragged = divmod(size, math.prod(axis_sizes))
   assert not ragged
-  mesh_spec = axis_env.sizes + (trailing_size,)
+  mesh_spec = axis_sizes + (trailing_size,)
   return _axis_groups(mesh_spec, mesh_axes)
 
 def _axis_groups(mesh_spec, mesh_axes):
@@ -624,9 +632,9 @@ class MutationData(NamedTuple):
 def _discharge_refs(
     jaxpr: core.ClosedJaxpr
 ) -> tuple[core.ClosedJaxpr, Sequence[int | None], MutationData]:
-  from jax._src.state.discharge import discharge_state2  # pyrefly: ignore[missing-import]
+  from jax._src.state.discharge import discharge_state  # pyrefly: ignore[missing-import]
   jaxpr, in_mut = _move_mutable_consts(jaxpr)
-  new_jaxpr = discharge_state2(jaxpr)
+  new_jaxpr = discharge_state(jaxpr)
   count = it.count(len(jaxpr.out_avals))  # new outputs are appended to the end
   inout_map = {i: next(count) for i, a in enumerate(jaxpr.in_avals)
                if isinstance(a, AbstractRef)}
@@ -653,10 +661,12 @@ def _move_mutable_consts(
 
 @weakref_lru_cache
 def _discharge_internal_refs(jaxpr: core.ClosedJaxpr) -> core.ClosedJaxpr:
+  # TODO(slebedev): Inline this function.
   from jax._src.state.discharge import discharge_state  # pyrefly: ignore[missing-import]
-  jaxpr_, consts = discharge_state(jaxpr.jaxpr, jaxpr.consts)
-  jaxpr_._debug_info = jaxpr.jaxpr._debug_info
-  return core.ClosedJaxpr(jaxpr_, consts)
+  discharged_jaxpr = discharge_state(jaxpr)
+  return discharged_jaxpr.replace(
+      jaxpr=discharged_jaxpr.jaxpr.replace(debug_info=jaxpr.jaxpr.debug_info)
+  )
 
 
 class SemanticallyEqualShardings:
@@ -821,7 +831,7 @@ def get_out_layouts_via_propagation(closed_jaxpr: core.ClosedJaxpr
   return tuple(safe_map(read, jaxpr.outvars))
 
 
-MaybeLayout = Sequence[Union[Layout, AutoLayout, None]]
+MaybeLayout = Sequence[Union[Layout, AutoLayoutSingleton, None]]
 
 
 class AllArgsInfo(NamedTuple):
@@ -1413,7 +1423,7 @@ def maybe_recover_user_shardings(
 
   return new_shardings
 
-def is_user_xla_layout_equal(ul: Layout | AutoLayout,
+def is_user_xla_layout_equal(ul: Layout | AutoLayoutSingleton,
                              xl: Layout) -> bool:
   if isinstance(ul, Layout) and not ul.tiling:
     return ul.major_to_minor == xl.major_to_minor
@@ -1459,10 +1469,6 @@ def _get_layouts_from_executable(
   assert all(isinstance(i, Layout) for i in new_in_layouts)
   assert all(isinstance(o, Layout) for o in new_out_layouts)
   return new_in_layouts, new_out_layouts
-
-
-def get_logical_mesh_ids(mesh_shape):
-  return np.arange(math.prod(mesh_shape)).reshape(mesh_shape)
 
 
 def create_compile_options(
@@ -1631,7 +1637,7 @@ def maybe_concretize_mesh(sharding, da: xc.DeviceList):
   return sharding
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class UnloadedMeshExecutable:
   xla_executable: Any
   device_list: xc.DeviceList
@@ -1743,10 +1749,8 @@ class UnloadedMeshExecutable:
         global_in_avals, global_out_avals)
 
     del in_layouts, out_layouts
-    dispatch_in_layouts = [
-        None if is_default_layout(l, s, a) else l
-        for l, s, a, in safe_zip(xla_in_layouts, in_shardings, global_in_avals)
-    ]
+    dispatch_in_layouts = get_dispatch_layouts(xla_in_layouts, in_shardings,
+                                               global_in_avals)
 
     out_shardings = maybe_recover_user_shardings(
         in_shardings, out_shardings, global_in_avals, global_out_avals,
@@ -1953,22 +1957,28 @@ class MeshExecutable(stages.Executable):
         fastpath_data = None
       return outs, fastpath_data, False  # Do not remove cache entry
 
-    return xc._xla.pjit(
+    return _jax.pjit(
         self.unsafe_call.name, None, aot_cache_miss, [], [],
         JitGlobalCppCacheKeys(), tree_util.dispatch_registry, cc_shard_arg)
 
   def shard_const_args(self, const_args: Sequence[ArrayLike]):
-    nr_const_args = len(const_args)
-    return shard_args(
-        self._in_shardings[:nr_const_args],
-        self._xla_in_layouts[:nr_const_args],
-        [xc.ArrayCopySemantics.REUSE_INPUT] * nr_const_args,
-        const_args)
+    num_const_args = len(const_args)
+    xla_const_layouts = self._xla_in_layouts[:num_const_args]
+    in_const_shardings = self._in_shardings[:num_const_args]
+    const_avals = [core.typeof(c) for c in const_args]
+    dispatch_layouts = get_dispatch_layouts(
+        xla_const_layouts, in_const_shardings, const_avals)
+    return shard_args(in_const_shardings, dispatch_layouts,
+                      [xc.ArrayCopySemantics.REUSE_INPUT] * num_const_args,
+                      const_args)
 
 def cc_shard_arg(x, sharding, layout):
   return shard_args([sharding], [layout], [xc.ArrayCopySemantics.REUSE_INPUT],
                     [x])[0]
 
+def get_dispatch_layouts(xla_in_layouts, in_shardings, in_avals):
+  return [None if is_default_layout(l, s, a) else l
+          for l, s, a, in safe_zip(xla_in_layouts, in_shardings, in_avals)]
 
 def check_arg_avals_for_call(ref_avals, arg_avals,
                              jaxpr_debug_info: core.DebugInfo):

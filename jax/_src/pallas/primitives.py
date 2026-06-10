@@ -173,20 +173,21 @@ def _load_pp_rule(eqn, context, settings):
   # TODO(sharadmv): pretty print mask and other
   annotation = (source_info_util.summarize(eqn.source_info)
                 if settings.source_info else None)
-  lhs = jax_core.pp_vars([y], context, print_shapes=settings.print_shapes)
+  lhs = jax_core.pp_vars([y], context, print_shapes=settings.print_shapes,
+                         is_binder=True)
   result = [lhs, pp.text(" <- ", annotation=annotation),
             sp.pp_ref_transforms(context, x, transforms)]
   if mask is not None:
     result += [
         pp.text(" "),
         pp.text("mask="),
-        pp.text(jax_core.pp_var(mask, context)),
+        jax_core.pp_var(mask, context),
     ]
   if other is not None:
     result += [
         pp.text(" "),
         pp.text("other="),
-        pp.text(jax_core.pp_var(other, context)),
+        jax_core.pp_var(other, context),
     ]
   return pp.concat(result)
 jax_core.pp_eqn_rules[load_p] = _load_pp_rule
@@ -341,8 +342,9 @@ def _swap_pp_rule(eqn, context, settings):
     return pp.concat([
         x_i,
         pp.text(" <- ", annotation=annotation),
-        pp.text(jax_core.pp_var(val, context))])
-  y = jax_core.pp_vars([y], context, print_shapes=settings.print_shapes)
+        jax_core.pp_var(val, context)])
+  y = jax_core.pp_vars([y], context, print_shapes=settings.print_shapes,
+                       is_binder=True)
   result = [
       y,
       pp.text(", "),
@@ -350,13 +352,13 @@ def _swap_pp_rule(eqn, context, settings):
       pp.text(" <- ", annotation=annotation),
       x_i,
       pp.text(", "),
-      pp.text(jax_core.pp_var(val, context)),
+      jax_core.pp_var(val, context),
   ]
   if mask is not None:
     result += [
         pp.text(" "),
         pp.text("mask="),
-        pp.text(jax_core.pp_var(mask, context)),
+        jax_core.pp_var(mask, context),
     ]
   return pp.concat(result)
 jax_core.pp_eqn_rules[swap_p] = _swap_pp_rule
@@ -696,6 +698,8 @@ def run_scoped(
       t.ref if isinstance(t, state_types.TransformedRef) else t
       for t in ref_avals
   ]
+  # Note that only a subset of all transforms can be found here, and they are
+  # never expected to contain any arrays.
   ref_transforms = tuple(
       t.transforms if isinstance(t, state_types.TransformedRef) else ()
       for t in ref_avals
@@ -708,12 +712,15 @@ def run_scoped(
   # there.
   with config.mutable_array_checks(False):
     jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(flat_fun, avals)
-  out = run_scoped_p.bind(*consts, jaxpr=jaxpr, collective_axes=collective_axes)
+  out = run_scoped_p.bind(*consts,
+                          jaxpr=jaxpr,
+                          collective_axes=collective_axes,
+                          ref_transforms=ref_transforms)
   return tree_util.tree_unflatten(out_tree_thunk(), out)
 
 
 @run_scoped_p.def_effectful_abstract_eval
-def _run_scoped_abstract_eval(*args, jaxpr, collective_axes):
+def _run_scoped_abstract_eval(*args, jaxpr, collective_axes, **_):
   del args, collective_axes
   # jaxpr will have effects for its inputs (Refs that are allocated) and for
   # constvars (closed over Refs). The effects for the allocated Refs are local
@@ -735,7 +742,9 @@ def _run_scoped_discharge_rule(
     out_avals,
     *args_flat,
     jaxpr,
-    collective_axes):
+    collective_axes,
+    ref_transforms,
+    **_):
   del out_avals
   if collective_axes:
     raise NotImplementedError(
@@ -746,11 +755,11 @@ def _run_scoped_discharge_rule(
   # discharge the requested refs we need to move them to the invar set.
   jaxpr_noconst = pe.convert_constvars_jaxpr(jaxpr)
   num_return_values = len(jaxpr_noconst.outvars)
-  discharged_body, new_consts = state_discharge.discharge_state(
-      jaxpr_noconst,
-      [],
+  discharged_closed_body = state_discharge.discharge_state(
+      jax_core.ClosedJaxpr(jaxpr_noconst, ()),
       should_discharge=should_discharge + [False] * len(jaxpr.invars),
   )
+  discharged_body, new_consts = discharged_closed_body.jaxpr, discharged_closed_body.consts
   if new_consts:
     raise NotImplementedError(
         "Cannot handle new consts created by state discharge.")
@@ -761,7 +770,8 @@ def _run_scoped_discharge_rule(
   # Run_scoped discharged the external variables but the scoped ones
   # are not discharged.
   out = run_scoped_p.bind(
-      *args_flat, jaxpr=discharged_body, collective_axes=collective_axes
+      *args_flat, jaxpr=discharged_body, collective_axes=collective_axes,
+      ref_transforms=ref_transforms,
   )
   # Order of outputs:
   # (1) return values, (2) closed refs, (3) scoped refs.
@@ -781,7 +791,7 @@ state_discharge.register_partial_discharge_rule(run_scoped_p)(
 
 
 @functools.partial(mlir.register_lowering, run_scoped_p)
-def _run_scoped_lowering_rule(ctx, *args, jaxpr, collective_axes):
+def _run_scoped_lowering_rule(ctx, *args, jaxpr, collective_axes, **_):
   if collective_axes:
     raise ValueError(
         "run_scoped lowering outside of Pallas does not support"
@@ -789,9 +799,11 @@ def _run_scoped_lowering_rule(ctx, *args, jaxpr, collective_axes):
     )
   jaxpr_noconst = pe.convert_constvars_jaxpr(jaxpr)
   num_return_values = len(jaxpr_noconst.outvars)
-  discharged_body, new_consts = state_discharge.discharge_state(
-      jaxpr_noconst, [], should_discharge=True)
-  if new_consts:    raise NotImplementedError(
+  discharged_closed_body = state_discharge.discharge_state(
+      jax_core.ClosedJaxpr(jaxpr_noconst, ()), should_discharge=True)
+  discharged_body, new_consts = discharged_closed_body.jaxpr, discharged_closed_body.consts
+  if new_consts:
+    raise NotImplementedError(
         "Cannot handle new consts created by state discharge.")
 
   def _lower_fun(*lower_fun_args):
@@ -1033,6 +1045,32 @@ def _semaphore_signal_abstract_eval(
       effs.add(pallas_core.comms_effect)
   return [], effs
 
+
+def _pp_device_id(device_id, context):
+  if device_id is None:
+    return pp.text("None")
+  elif isinstance(device_id, dict):
+    items = []
+    for k, v in device_id.items():
+      item = pp.concat([pp.text(f"{k}: "), _pp_device_id(v, context)])
+      items.append(item)
+    return pp.concat(
+        [pp.text("{"), pp.join(pp.text(", "), items), pp.text("}")]
+    )
+  elif isinstance(device_id, tuple):
+    items = [_pp_device_id(v, context) for v in device_id]
+    return pp.concat(
+        [pp.text("("), pp.join(pp.text(", "), items), pp.text(")")]
+    )
+  elif isinstance(device_id, list):
+    items = [_pp_device_id(v, context) for v in device_id]
+    return pp.concat(
+        [pp.text("["), pp.join(pp.text(", "), items), pp.text("]")]
+    )
+  else:
+    return jax_core.pp_var(device_id, context)
+
+
 def _semaphore_signal_pp_eqn(eqn: jax_core.JaxprEqn,
                              context: jax_core.JaxprPpContext,
                              settings: jax_core.JaxprPpSettings):
@@ -1051,18 +1089,15 @@ def _semaphore_signal_pp_eqn(eqn: jax_core.JaxprEqn,
       pp.text(" "),
       sp.pp_ref_transforms(context, sem, sem_transforms),
       pp.text(" "),
-      pp.text(jax_core.pp_var(value, context)),
+      jax_core.pp_var(value, context),
   ])
   if device_ids is not None:
     flat_device_ids = tree_util.tree_leaves(device_ids)
     if not flat_device_ids:
       return out
-    device_ids_pp = [pp.text(jax_core.pp_var(flat_device_ids[0], context))]
-    for device_id in flat_device_ids[1:]:
-      device_ids_pp.append(pp.text(" "))
-      device_ids_pp.append(pp.text(jax_core.pp_var(device_id, context)))
-    out = pp.concat([out, pp.concat(device_ids_pp)])
+    out = pp.concat([out, pp.text(" "), _pp_device_id(device_ids, context)])
   return out
+
 jax_core.pp_eqn_rules[semaphore_signal_p] = _semaphore_signal_pp_eqn
 
 
@@ -1140,7 +1175,7 @@ def _semaphore_wait_pp_eqn(eqn: jax_core.JaxprEqn,
       pp.text(" "),
       sp.pp_ref_transforms(context, sem, sem_transforms),
       pp.text(" "),
-      pp.text(jax_core.pp_var(value, context)),
+      jax_core.pp_var(value, context),
   ]
   return pp.concat(parts)
 jax_core.pp_eqn_rules[semaphore_wait_p] = _semaphore_wait_pp_eqn
@@ -1347,9 +1382,10 @@ def _jaxpr_call_discharge(
       [treedef.num_leaves for treedef in ref_treedefs[: len(ref_treedefs) - 1]],
   )
   should_discharge = [*map(any, flat_should_discharge)]
-  discharged_jaxpr, discharged_consts = state_discharge.discharge_state(
-      jaxpr, (), should_discharge=should_discharge
+  discharged_closed_jaxpr = state_discharge.discharge_state(
+      jax_core.ClosedJaxpr(jaxpr, ()), should_discharge=should_discharge
   )
+  discharged_jaxpr, discharged_consts = discharged_closed_jaxpr.jaxpr, discharged_closed_jaxpr.consts
   assert not discharged_consts
   outs = jaxpr_call_p.bind(
       *flat_args,

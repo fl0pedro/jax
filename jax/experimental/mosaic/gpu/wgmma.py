@@ -83,13 +83,13 @@ class WGMMAAccumulator:
     )
 
   @classmethod
-  def from_registers(cls, registers):
+  def from_registers(cls, registers, sync=True):
     original_layout = registers.layout
     if registers.layout != fa.WGMMA_LAYOUT and registers.layout != fa.WGMMA_LAYOUT_ACC_32BIT:
       raise ValueError("Only WGMMA layouts supported in WGMMAAccumulator")
     if utils.bitwidth(registers.mlir_dtype) == 32:
       registers = registers.to_layout(fa.WGMMA_LAYOUT_ACC_32BIT)
-    return cls(_value=registers, _original_layout=original_layout)
+    return cls(_value=registers, _original_layout=original_layout, _sync=sync)
 
   def tree_flatten(self):
     return (self._value,), (self._original_layout,)
@@ -264,9 +264,6 @@ def wgmma_m64(
   expected_regs_per_tile = 4 if utils.bitwidth(out_ty) == 32 else 2
   if acc.ndim != expected_dim or acc.shape[0] != 1 or math.prod(acc.shape[2:]) != expected_regs_per_tile:
     raise ValueError(acc.shape)
-  acc_struct_type = ir.Type.parse(
-      f"!llvm.struct<({','.join(str(out_ty_field) for _ in acc_regs)})>"
-  )
   for i in range((swizzle // bytewidth(element_type)) // k_instr):
     # Slice out the relevant part of A or advance the A descriptor.
     if a_in_regs:
@@ -288,7 +285,7 @@ def wgmma_m64(
       )
     assert len(a_args) == len(a_reg_constraints)
     acc_struct = llvm.inline_asm(
-        acc_struct_type,
+        llvm.StructType.get_literal([out_ty_field] * len(acc_regs)),
         [*acc_regs, *a_args, b_descriptor, *imms],
         ptx,
         reg_constraints,

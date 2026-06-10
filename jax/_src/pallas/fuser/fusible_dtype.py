@@ -34,6 +34,7 @@ from jax._src import util
 from jax._src.interpreters import partial_eval as pe
 from jax._src.lax.control_flow import conditionals
 from jax._src.pallas import core as pallas_core
+from jax._src.pallas import mpmd
 from jax._src.pallas import pallas_call
 from jax._src.pallas import primitives as pallas_primitives
 from jax._src.pallas.fuser import block_spec
@@ -393,6 +394,26 @@ def _core_map_rule(ctx: Context, *args, jaxpr, **params):
 _physicalize_rules[pallas_core.core_map_p] = _core_map_rule
 
 
+def _mpmd_map_rule(ctx: Context, *args, jaxprs, meshes, external_meshes, **params):
+  _assert_no_fusion_types(ctx.avals_in)
+  _assert_no_fusion_types(ctx.avals_out)
+  all_meshes = meshes + external_meshes
+  new_jaxprs = []
+  for mesh, jaxpr in zip(meshes, jaxprs):
+    with mpmd.mpmd_map_tracing_context(mesh, all_meshes):
+      new_jaxprs.append(physicalize_jaxpr(jaxpr))
+  return mpmd.mpmd_map_p.bind(
+      *args,
+      jaxprs=tuple(new_jaxprs),
+      meshes=meshes,
+      external_meshes=external_meshes,
+      **params,
+  )
+
+
+_physicalize_rules[mpmd.mpmd_map_p] = _mpmd_map_rule
+
+
 def _run_scoped_rule(ctx: Context, *args, jaxpr, **params):
   _assert_no_fusion_types(ctx.avals_out)
   jaxpr = physicalize_jaxpr(jaxpr)
@@ -549,10 +570,10 @@ def _unpack_dtype_eval_rule(ctx: block_spec.KernelEvalContext, *args):
   return aval_in.dtype.unpack_eval_rule(ctx, *args)  # pyrefly: ignore[missing-attribute]
 
 
-def _call_hi_primitive_physicalize_rule(ctx, *args, _prim):
+def _call_hi_primitive_physicalize_rule(ctx, *args, _prim, **params):
   if hasattr(_prim, "physicalize"):
-    return _prim.physicalize(ctx, *args)
-  return hijax.call_hi_primitive_p.bind(*args, _prim=_prim)
+    return _prim.physicalize(ctx, *args, **params)
+  return hijax.call_hi_primitive_p.bind(*args, _prim=_prim, **params)
 
 
 _physicalize_rules[hijax.call_hi_primitive_p] = _call_hi_primitive_physicalize_rule

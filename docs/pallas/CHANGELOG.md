@@ -13,17 +13,122 @@ Remember to align the itemized text with the first line of an item within a list
 
 ## Unreleased
 
+* New features
+
+  * Added {data}`jax.experimental.pallas.enable_poison_buffers` (config flag
+    `jax_pallas_poison_buffers`) to poison (initialize with NaNs or lowest
+    possible integers) any scratch buffers allocated by Pallas in Mosaic TPU
+    lowering for debugging.
+  * Support TMA scatter.
+  * Rename `TMA_GATHER_INDICES_LAYOUT` to `TMA_INDICES_LAYOUT`.
+
+* Deprecations
+
+  * `pl.debug_checks_enabled` is deprecated. Use `pl.enable_debug_checks.value`.
+  * `pl.dot` was moved into {mod}`jax.experimental.pallas.triton`.
+    Accessing it via {mod}`jax.experimental.pallas` is deprecated.
+    You can use {func}`jax.numpy.dot`, {func}`jax.numpy.einsum` or the `@`
+    operator instead in a TPU or MGPU kernel.
+
+### TPU
+
+* Changes
+
+  * {class}`jax.experimental.pallas.tpu.CompilerParams` now defaults
+    ``needs_layout_passes`` to True. The layout passes are still a work in
+    progress. Please file a bug if you encounter a compilation error with
+    them enabled.
+  * {class}`jax.experimental.pallas.tpu.CompilerParams` now defaults
+    ``use_tc_tiling_on_sc`` to True for SparseCore kernels.
+
+* Removals
+
+  * Removed the previously deprecated
+    {class}`jax.experimental.pallas.tpu.KernelType` and
+    {func}`jax.experimental.pallas.tpu.repeat`.
+
+* Deprecations
+
+  * Deprecated `pltpu.HOST` and `pltpu.MemorySpace.HOST` in favor of `pl.HOST`.
+
 ### Mosaic GPU
 
 * New features
 
-  * Added `barrier_test` function; a non-blocking equivalent of `barrier_wait`.
+  * Support using {func}`jax.experimental.pallas.multiple_of` to specify
+    divisibility requirements on dynamic indices.
+  * Support allocating multidimensional `plgpu.Barrier`s and
+    `plgpu.ClusterBarrier`s, by providing a nD shape as the `num_barriers`
+    parameter.
+
+* Changes
+
+  * Breaking change: {func}`jax.experimental.pallas.program_id` and
+    {func}`jax.experimental.pallas.num_programs` no longer work inside
+    kernels defined via {func}`jax.experimental.pallas.mosaic_gpu.kernel`.
+    Use {func}`jax.lax.axis_index` and {func}`jax.lax.axis_size` instead.
+  * {func}`jax.experimental.pallas.mosaic_gpu.kernel` now has the same API as
+    {func}`jax.experimental.pallas.kernel`, meaning that it can be used as
+    a decorator and also uses ``out_type`` and ``scratch_types`` instead of
+    ``out_shape`` and ``scratch_shapes``.
+
+* Removals
+
+  * Deleted `plgpu.unswizzle_ref` and `plgpu.untile_ref`.
+
+* Deprecations
+
+  * Using {func}`jax.experimental.pallas.pallas_call` for Mosaic GPU kernels
+    is deprecated. Please migrate to
+    {func}`jax.experimental.pallas.mosaic_gpu.kernel` and
+    {func}`jax.experimental.pallas.mosaic_gpu.emit_pipeline`.
+
+## Released with JAX 0.10.1
+
+* Changes
+
+  * Added {func}`jax.experimental.pallas.align_to`, a utility that rounds a
+    value up to the nearest multiple of a given alignment.
+  * {func}`jax.experimental.pallas.pallas_call` no longer supports checkify.
+    We expect this change to affect few users, as in our experience most
+    kernels either perform no checking or use
+    {func}`jax.experimental.pallas.debug_check` for conditionally-enabled
+    runtime checks.
+  * {func}`jax.experimental.pallas.kernel` now always aliases Refs that are
+    passed in or closed-over.
+
+### TPU
+
+* Removals
+
+  * Removed the `kernel_type` field from
+    {class}`jax.experimental.pallas.tpu.CompilerParams`. It was only used for
+    writing SparseCore kernels via {func}`jax.experimental.pallas.pallas_call`,
+    which is now unsupported. The recommended API for SparseCore kernels is
+    {func}`jax.experimental.pallas.kernel`.
+
+
+### Mosaic GPU
+
+* New features
+
+  * Added {func}`jax.experimental.pallas.mosaic_gpu.barrier_test` function; a
+    non-blocking equivalent of
+    {func}`jax.experimental.pallas.mosaic_gpu.barrier_wait` only supported in
+    a warp context.
+
+* Changes
+
+  * Breaking change: removed `plgpu.TransposeTransform`.
 
 ## Released with JAX 0.10.0
 
 * Changes
 
-  * Breaking change: refactored `pl.kernel` to use `out_type` instead of `out_shape` and `scratch_types` instead of `scratch_shapes`. Existing usages calling `pl.kernel` with these keyword arguments must be updated.
+  * Breaking change: refactored `pl.kernel` to use `out_type` instead of
+    `out_shape` and `scratch_types` instead of `scratch_shapes`. Existing
+    usages calling {func}`jax.experimental.pallas.kernel` with these keyword
+    arguments must be updated.
 
 ### TPU
 

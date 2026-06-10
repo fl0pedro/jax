@@ -293,6 +293,9 @@ NB_MODULE(_jax, m) {
 
   tsl::ImportNumpy();
 
+  auto hlo_module = nb::module_::import_(
+      "jaxlib._hlo");
+
   // Exceptions
   register_runtime_error_bindings(m);
   nb::register_exception_translator(translate_xla_runtime_error);
@@ -595,8 +598,10 @@ NB_MODULE(_jax, m) {
         });
 
   TF_CHECK_OK(PyArray::Register(m));
+  InitCanonicalizeValueHandlers();
   PyDeviceList::Register(m);
   RegisterSharding(m);
+  RegisterPartitionSpec(m);
 
   nb::class_<xla::CompiledMemoryStats>(m, "CompiledMemoryStats")
       .def_rw("generated_code_size_in_bytes",
@@ -1057,12 +1062,30 @@ NB_MODULE(_jax, m) {
   m.def("get_internal_device_put_info",
         []() { return DevicePutInfo::GetInfo(); });
 
-  PartitionSpec::Register(m);
-
   m.def("set_typed_int_type", &SetTypedIntType);
   m.def("set_typed_float_type", &SetTypedFloatType);
   m.def("set_typed_complex_type", &SetTypedComplexType);
   m.def("set_typed_ndarray_type", &SetTypedNdArrayType);
+  m.def("set_invalid_input_exception", &SetInvalidInputException);
+  m.def("set_valid_dtypes", &SetValidDtypes);
+  m.def(
+      "register_canonicalize_value_handler",
+      [](nb::object type, nb::object handler) {
+        if (handler.is_none()) {
+          RegisterCanonicalizeValueHandler(
+              type.ptr(),
+              [](nb::handle x) { return nb::borrow<nb::object>(x.ptr()); });
+        } else {
+          RegisterCanonicalizeValueHandler(
+              type.ptr(),
+              [handler](nb::handle x) { return handler(x); });
+        }
+      },
+      "Registers a handler for canonicalizing a value of a specific type. "
+      "If handler is None, registers an identity handler.",
+      nb::arg("type"), nb::arg("handler").none());
+  m.def("canonicalize_value", &CanonicalizeValue,
+        nb::sig("def canonicalize_value(arg: Any, /) -> Any"));
 }  // NOLINT(readability/fn_size)
 
 }  // namespace jax

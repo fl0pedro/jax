@@ -90,6 +90,10 @@ class OpsTest(ptu.PallasTPUTest):
   def test_bitcast(
       self, from_dtype, to_dtype, is_ref_bitcast, use_primitive_io_op
   ):
+    affected_types = {jnp.float8_e5m2, jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz}
+    if from_dtype in affected_types or to_dtype in affected_types:
+      if not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+        self.skipTest("Requires libtpu built on or after 2026-05-26 for float8")
     if not jtu.is_device_tpu_at_least(version=4):
       self.skipTest("Run on TPUv4+ to have expected memory layout")
     if from_dtype == to_dtype:
@@ -132,6 +136,10 @@ class OpsTest(ptu.PallasTPUTest):
       to_dtype=_JAX_DTYPES,
   )
   def test_bitcast_scalar(self, from_dtype, to_dtype):
+    affected_types = {jnp.float8_e5m2, jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz}
+    if from_dtype in affected_types or to_dtype in affected_types:
+      if not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+        self.skipTest("Requires libtpu built on or after 2026-05-26 for float8")
     if from_dtype == to_dtype:
       self.skipTest("No bitcast needed")
     if dtypes.itemsize_bits(from_dtype) != dtypes.itemsize_bits(to_dtype):
@@ -179,6 +187,21 @@ class OpsTest(ptu.PallasTPUTest):
         out_shape=jax.ShapeDtypeStruct((m * 2, n), jnp.bfloat16),
     )(x, y)
     np.testing.assert_array_equal(out, inp.reshape(m * 2, n))
+
+  @parameterized.parameters(0, 1)
+  def test_bitcast_vmap(self, axis):
+    def kernel(x_ref, out_ref):
+      out_ref[...] = jax.vmap(functools.partial(pltpu.bitcast, ty=jnp.uint8),
+                              in_axes=axis, out_axes=axis)(x_ref[...])
+    expected = np.random.randint(0, 255, size=(2, 16, 4, 128), dtype=np.uint8)
+    inp = np.ascontiguousarray(
+        expected.swapaxes(-1, -2)).view(np.uint32)[..., 0]
+    assert inp.shape == (2, 16, 128), inp.shape
+    out = self.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((2, 16 * 4, 128), jnp.uint8)
+    )(inp)
+    self.assertArraysEqual(out, expected.reshape(2, 16 * 4, 128))
 
   @parameterized.parameters([jnp.int32, jnp.int16, jnp.int8, jnp.int4])
   def test_row_broadcast(self, dtype):
@@ -248,7 +271,10 @@ class OpsTest(ptu.PallasTPUTest):
       )(a, b, c, d)
 
     result_pallas = pallas_fn(a_val, b_val, c_val, d_val)
-    expected = jnp.dot(a_val, b_val) + jnp.dot(c_val, d_val)
+    expected = (
+        jnp.dot(a_val, b_val, precision=jax.lax.Precision.HIGHEST)
+        + jnp.dot(c_val, d_val, precision=jax.lax.Precision.HIGHEST)
+    )
     self.assertAllClose(result_pallas, expected, atol=1e-5, rtol=1e-5)
 
   @parameterized.product(from_dtype=_JAX_INT_DTYPES,
@@ -331,10 +357,6 @@ class OpsTest(ptu.PallasTPUTest):
     if dtype == jnp.int16:
       if jtu.get_tpu_version() < 4:
         self.skipTest("Requires TPUv4+")
-      if jtu.get_tpu_version() < 5 and not jtu.is_cloud_tpu_at_least(
-          2026, 4, 6
-      ):
-        self.skipTest("requires newer libTPU")
 
     shape = (128, 128)
 
@@ -499,10 +521,6 @@ class OpsTest(ptu.PallasTPUTest):
     if msk_dtype == jnp.int16:
       if jtu.get_tpu_version() < 4:
         self.skipTest("Requires TPUv4+")
-      if jtu.get_tpu_version() < 5 and not jtu.is_cloud_tpu_at_least(
-          2026, 4, 6
-      ):
-        self.skipTest("requires newer libTPU")
 
     shape = (1024,)
 
@@ -786,6 +804,9 @@ class OpsTest(ptu.PallasTPUTest):
       [jnp.bfloat16, jnp.float8_e5m2, jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz]
   )
   def test_stochastic_round(self, target_dtype):
+    if target_dtype in {jnp.float8_e5m2, jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz}:
+      if not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+        self.skipTest("Requires libtpu built on or after 2026-05-26")
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("Requires TPU v5+")
 
@@ -887,9 +908,13 @@ class OpsTest(ptu.PallasTPUTest):
           (jnp.int32, jnp.int16),
           (jnp.int32, jnp.int8),
           (jnp.int32, jnp.int4),
+          (jnp.int16, jnp.int8),
+          (jnp.int16, jnp.int4),
+          (jnp.int8, jnp.int4),
+          (jnp.int4, jnp.int2),
       ],
-      index=[0, 1, 3],
-      shape=[(8, 128), (2, 15, 300)],
+      index=[0, 1, 2, 3],
+      shape=[(8, 128), (2, 15, 300), (512, 256)],
   )
   def test_unpack_elementwise(self, config, index, shape):
     unpacked_dtype, packed_dtype = config
@@ -897,9 +922,21 @@ class OpsTest(ptu.PallasTPUTest):
         version=5
     ):
       self.skipTest("Requires TPU v5+")
+    if dtypes.itemsize_bits(
+        unpacked_dtype
+    ) != 32 and not jtu.is_cloud_tpu_at_least(2026, 5, 27):
+      self.skipTest("Requires newer libtpu")
+    if packed_dtype == jnp.int2:
+      if not jtu.is_device_tpu_at_least(version=5):
+        self.skipTest("Requires TPU v5+")
+      if (shape[-2] % (8 * 16)) or (shape[-1] % 128):
+        raise self.skipTest(
+            "int2 is only supported for shapes with vreg alignment"
+        )
 
-    bitwidth = dtypes.itemsize_bits(packed_dtype)
-    packing_factor = 32 // bitwidth
+    unpacked_bitwidth = dtypes.itemsize_bits(unpacked_dtype)
+    packed_bitwidth = dtypes.itemsize_bits(packed_dtype)
+    packing_factor = unpacked_bitwidth // packed_bitwidth
 
     if index >= packing_factor:
       self.skipTest(
@@ -986,7 +1023,7 @@ class OpsTest(ptu.PallasTPUTest):
 
     @functools.partial(
       self.pallas_call,
-      out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+      out_shape=jax.ShapeDtypeStruct.like(x),
     )
     def kernel(x_ref, out_ref):
       out_ref[...] = jax.scipy.special.erf(x_ref[...])
@@ -1001,7 +1038,7 @@ class OpsTest(ptu.PallasTPUTest):
     rhs = jnp.zeros((k, 128), dtype=dtype)
 
     def kernel(lhs_ref, rhs_ref, o_ref):
-      o_ref[...] = pl.dot(lhs_ref[...], rhs_ref[...])
+      o_ref[...] = lhs_ref[...] @ rhs_ref[...]
 
     out_shape = jax.ShapeDtypeStruct((8 * packing, 128), dtype)
     with self.assertRaisesRegex(
@@ -1102,6 +1139,38 @@ class OpsTest(ptu.PallasTPUTest):
     np.testing.assert_array_equal(
         kernel(x, y),
         jnp.concatenate([x, y], axis=0),
+    )
+
+  def test_fuse_transposed_lhs_in_matmul(self):
+
+    lhs_shape = (512, 128)
+    rhs_shape = (512, 256)
+
+    def kernel(lhs_ref, rhs_ref, o_ref):
+      o_ref[...] = jnp.einsum("km,kn->mn", lhs_ref[...], rhs_ref[...])
+
+    lhs_key, rhs_key = jax.random.split(jax.random.key(42), 2)
+    lhs = (
+        jax.random.normal(lhs_key, lhs_shape, dtype=jnp.float32)
+        .astype(jnp.bfloat16)
+        .astype(jnp.float32)
+    )
+    rhs = (
+        jax.random.normal(rhs_key, rhs_shape, dtype=jnp.float32)
+        .astype(jnp.bfloat16)
+        .astype(jnp.float32)
+    )
+    result = self.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(
+            (lhs_shape[1], rhs_shape[1]), jnp.float32
+        ),
+        compiler_params=pltpu.CompilerParams(
+            fuse_transposed_lhs_in_matmul=True
+        ),
+    )(lhs, rhs)
+    np.testing.assert_allclose(
+        result, jnp.einsum("km,kn->mn", lhs, rhs), atol=1e-5
     )
 
 

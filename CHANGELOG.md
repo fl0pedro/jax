@@ -17,10 +17,38 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 ## Unreleased
 
 * New features
+  * Added {func}`jax.scipy.linalg.invhilbert` for the closed-form inverse
+    of the Hilbert matrix ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.invpascal` for the inverse of the Pascal
+    matrix ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.fiedler_companion` for constructing the
+    pentadiagonal Fiedler companion matrix of a polynomial
+    ({jax-issue}`#10144`).
+  * Added {func}`jax.ShapeDtypeStruct.like` -- a shortcut for constructing a
+    {class}`jax.ShapeDtypeStruct` from an object with `shape` and `dtype`
+    attributes.
+
+## JAX 0.10.1 (May 20, 2026)
+
+* New features
   * Added `ResizeMethod.AREA` to {func}`jax.image.resize`, which matches
     TensorFlow's AREA resizing ({jax-issue}`#20098`).
   * Added {func}`jax.scipy.linalg.hadamard` for constructing Hadamard
     matrices ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.circulant` for constructing circulant
+    matrices ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.dft` for constructing discrete Fourier
+    transform matrices ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.leslie` for constructing Leslie matrices
+    ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.companion` for constructing companion
+    matrices from polynomial coefficients ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.fiedler` for constructing symmetric Fiedler
+    matrices ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.linalg.helmert` for constructing Helmert matrices
+    ({jax-issue}`#10144`).
+  * Added {func}`jax.scipy.special.boxcox` and
+    {func}`jax.scipy.special.boxcox1p` for the Box-Cox power transformation.
   * Moved RNG APIs from "implementations" to dtypes ({jax-issue}`#27854`):
     * Added `jax.random.key_dtype` to get the dtype corresponding to a PRNG
       implementation name.
@@ -37,6 +65,10 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
   * Passing the `copy`, `order`, and `ndmin` arguments to
     {func}`jax.numpy.array` positionally is deprecated. Use keyword arguments
     instead. This matches the signature of `numpy.array`.
+  * Python `dict_values`, generators, zip return type and iterators generally
+    are deprecated by default when used as leaves in pytrees. In a future
+    version of JAX, this will become an error, if you depend on using them as
+    leaves, pass `is_leaf` to `jax.tree.*` methods.
 
 ## JAX 0.10.0 (April 16, 2026)
 

@@ -27,7 +27,6 @@ from jax._src import api
 from jax._src import config
 from jax._src import core
 from jax._src import dtypes
-from jax._src import linear_util as lu
 from jax._src import effects
 from jax._src import source_info_util
 from jax._src import traceback_util
@@ -47,7 +46,7 @@ from jax._src.state.types import AbstractRef
 from jax._src.traceback_util import api_boundary
 from jax._src.tree_util import (
     PyTreeDef, tree_flatten, tree_unflatten, tree_structure, broadcast_prefix,
-    tree_map, tree_leaves, Partial, tracing_registry)
+    tree_map, tree_leaves, Partial, tracing_registry, FlatTree)
 from jax._src.typing import DeprecatedArg
 from jax._src.util import (unzip2, wraps, split_list, partition_list, safe_map,
                            safe_zip, merge_lists, weakref_lru_cache)
@@ -480,9 +479,9 @@ def _trace_to_jaxpr(fun: Callable,
                     in_avals: Sequence[core.AbstractValue],
                     debug: core.DebugInfo
                     ) -> tuple[core.Jaxpr, Sequence[Any], PyTreeDef]:
-  flat_fun, out_tree = api_util.flatten_fun(lu.wrap_init(fun, debug_info=debug), in_tree)
+  in_avals_flat_tree = FlatTree(in_avals, in_tree, False)
   try:
-    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(flat_fun, in_avals)
+    closed_jaxpr, out_avals = pe.trace_to_jaxpr(fun, in_avals_flat_tree, debug)
   except core.ConcretizationTypeError as e:
     msg, = e.args
     if 'for checkpoint' in msg:
@@ -494,7 +493,7 @@ def _trace_to_jaxpr(fun: Callable,
           "\n")
       e.args = msg,
     raise
-  return pe.convert_constvars_jaxpr(jaxpr), consts, out_tree()
+  return pe.convert_constvars_jaxpr(closed_jaxpr.jaxpr), closed_jaxpr.consts, out_avals.tree
 
 
 ### Utilities
@@ -773,7 +772,8 @@ def _transpose_jaxpr(jaxpr: core.ClosedJaxpr,
                      in_lin: Sequence[bool],
                      out_zeros: Sequence[bool]):
   in_avals = ([a for a,  lin in zip(jaxpr.in_avals,  in_lin   ) if not lin] +
-              [a for a, zero in zip(jaxpr.out_avals, out_zeros) if not zero])
+              [a.to_ct_aval() for a, zero in zip(jaxpr.out_avals, out_zeros)
+               if not zero])
   cell = lambda: None
 
   def transposed(*args_flat):
@@ -789,10 +789,11 @@ def _transpose_jaxpr(jaxpr: core.ClosedJaxpr,
 
     # Transpose the linear jaxpr (which only has linear inputs).
     out_cts_iter = iter(out_cts_flat)
-    out_cts = [ad_util.Zero(aval) if zero else next(out_cts_iter)
+    out_cts = [ad_util.Zero(aval.to_ct_aval()) if zero else next(out_cts_iter)
                for aval, zero in zip(jaxpr.out_avals, out_zeros)]
     assert next(out_cts_iter, None) is None
-    dummy_args = [ad.UndefinedPrimal(aval) for aval in lin_jaxpr.in_avals[len(consts):]]
+    dummy_args = [ad.UndefinedPrimal(aval.to_ct_aval())
+                  for aval in lin_jaxpr.in_avals[len(consts):]]
     in_cts = ad.backward_pass(lin_jaxpr.jaxpr, False, lin_jaxpr.consts,
                               [*consts, *dummy_args], out_cts)
     in_cts = in_cts[len(consts):]
@@ -803,11 +804,10 @@ def _transpose_jaxpr(jaxpr: core.ClosedJaxpr,
     return in_cts_nz
 
   dbg = jaxpr.jaxpr.debug_info.with_unknown_names()
-  transposed_wrapped = lu.wrap_init(transposed, debug_info=dbg)
-  transposed_jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(
-      transposed_wrapped, in_avals)
-  transposed_jaxpr = core.ClosedJaxpr(transposed_jaxpr_, consts)
-  return transposed_jaxpr, cell.in_cts_zero  # pyrefly: ignore[missing-attribute]
+  in_avals_flat_tree = FlatTree.flatten((tuple(in_avals), {}))
+  transposed_closed_jaxpr, _ = pe.trace_to_jaxpr(
+      transposed, in_avals_flat_tree, dbg)
+  return transposed_closed_jaxpr, cell.in_cts_zero  # pyrefly: ignore[missing-attribute]
 
 def remat_vmap(axis_data, args, dims, *, jaxpr, **params):
   assert not jaxpr.constvars
@@ -862,10 +862,13 @@ def _remat_lowering(
   if differentiated and any(prevent_cse):
     _, barrier_avals = partition_list(prevent_cse, ctx.avals_in)
     other_args, barrier_args = partition_list(prevent_cse, args)
-    barrier_op = hlo.OptimizationBarrierOp(
-        mlir.flatten_ir_values(barrier_args))
-    barrier_results = mlir.unflatten_ir_values_like_types(
-        barrier_op.results, map(mlir._aval_to_ir_types, barrier_avals))
+    flat_barrier_args, _ = mlir.ir_tree_registry.flatten(barrier_args)
+    barrier_op = hlo.OptimizationBarrierOp(flat_barrier_args)
+    _, barrier_treedef = mlir.ir_tree_registry.flatten(
+        [mlir._aval_to_ir_types(ctx.module_context, a) for a in barrier_avals])
+    res = [mlir.lower_with_sharding_in_types(ctx, op, aval)
+           for op, aval in zip(barrier_op.results, barrier_avals)]
+    barrier_results = barrier_treedef.unflatten(res)
     args = merge_lists(prevent_cse, other_args, barrier_results)
   outs, tokens_out = mlir.jaxpr_subcomp(
       ctx.module_context, jaxpr, ctx.name_stack.extend('checkpoint'),
@@ -955,8 +958,12 @@ batching.primitive_batchers[name_p] = name_batcher
 @discharge.register_discharge_rule(remat_p)
 def _remat_state_discharge_rule(
     in_avals, out_avals, *args, jaxpr, **params):
-  discharged_jaxpr, () = discharge.discharge_state(jaxpr, [])
-  out_vals_ref_vals = remat_p.bind(*args, jaxpr=discharged_jaxpr, **params)
+  discharged_jaxpr = discharge.discharge_state(core.ClosedJaxpr(jaxpr, []))
+  if discharged_jaxpr.consts:
+    raise NotImplementedError
+  out_vals_ref_vals = remat_p.bind(
+      *args, jaxpr=discharged_jaxpr.jaxpr, **params
+  )
   out_vals, ref_vals = split_list(out_vals_ref_vals, [len(jaxpr.outvars)])
   ref_vals_ = iter(ref_vals)
   new_invals = [next(ref_vals_) if isinstance(a, AbstractRef) else None

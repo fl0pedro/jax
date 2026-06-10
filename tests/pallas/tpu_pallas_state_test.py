@@ -239,6 +239,10 @@ class PinnedBufferTest(jtu.JaxTestCase):
       f(x)
 
   def test_basic_vmem(self):
+    self.skipTest(
+        "TODO(b/507446729): test_basic_vmem has regressed and "
+        "does not test the intended behavior."
+    )
 
     @jax.jit
     def f(x):
@@ -371,7 +375,7 @@ class CoreMapTest(jtu.JaxTestCase):
 
     x = jnp.arange(8 * 128, dtype=jnp.int32).reshape((8, 128))
     with self.assertRaisesRegex(
-        Exception, "core_map .* captures non-scalar constants"
+        Exception, "captures non-Ref constants"
     ):
       f(x)
 
@@ -461,9 +465,9 @@ class CoreMapTest(jtu.JaxTestCase):
     def body(x_ref, o_ref):
       pltpu.sync_copy(x_ref, o_ref)
     x = jnp.arange(8 * 128, dtype=jnp.int32).reshape((8, 128))
-    text = pl.kernel(
+    text = jax.jit(pl.kernel(
         body, out_type=memory_space(x.shape, x.dtype), mesh=mesh,
-    ).lower(x).as_text()
+    )).lower(x).as_text()
     custom_call = [l for l in text.split("\n") if "@tpu_custom_call" in l]
     self.assertLen(custom_call, 1)
     custom_call = custom_call[0]

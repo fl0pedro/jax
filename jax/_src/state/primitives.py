@@ -152,6 +152,10 @@ def ref_get(
 
   .. _Ref guide: https://docs.jax.dev/en/latest/array_refs.html
   """
+  if isinstance(ref, TransformedRef) and ref.multiref:
+    raise NotImplementedError(
+        "ref_get with multi-ref TransformedRef is not supported."
+    )
   ref, transforms = get_ref_and_transforms(ref, idx, "ref_get")
   flat_transforms, tree = tree_util.tree_flatten(transforms)
   return get_p.bind(ref, *flat_transforms, tree=tree)
@@ -244,6 +248,10 @@ def ref_swap(
 
   .. _Ref guide: https://docs.jax.dev/en/latest/array_refs.html
   """
+  if isinstance(ref, TransformedRef) and ref.multiref:
+    raise NotImplementedError(
+        "ref_swap with multi-ref TransformedRef is not supported."
+    )
   if hasattr(ref, 'dtype'):
     value = _maybe_implicit_cast(ref.dtype, value)
   ref, transforms = get_ref_and_transforms(ref, idx, _function_name)
@@ -497,9 +505,17 @@ def pp_ref_transforms(context: core.JaxprPpContext, ref, transforms=()):
   if isinstance(ref, TransformedRef):
     transforms = ref.transforms
     ref = ref.ref
+  if isinstance(ref, tuple):
+    ref_doc = pp.concat([
+        pp.text("("),
+        pp.join(pp.text(", "), [pp_ref_transforms(context, r) for r in ref]),
+        pp.text(")"),
+    ])
+  else:
+    ref_doc = core.pp_var(ref, context)
   return pp_ref_var(
       pp.concat([
-          pp.text(core.pp_var(ref, context)),
+          ref_doc,
           _pp_transforms(context, transforms),
       ])
   )
@@ -525,14 +541,13 @@ def _swap_pp_rule(eqn, context, settings) -> pp.Doc:
   transforms = tree_util.tree_unflatten(eqn.params["tree"], flat_idx)
   annotation = (source_info_util.summarize(eqn.source_info)
                 if settings.source_info else None)
-  if type(y) is core.DropVar:
-    # In the case of a set (ignored return value),
-    # pretty print `_ = swap x v i` as `x[i] <- v`
+  if context.var_names.get(y) == '_':
+    # In the case of a set (ignored return value), print as `x[i] <- v`
     del y
     return pp.concat([
         pp_ref_transforms(context, x, transforms),
         pp.text(" <- ", annotation=annotation),
-        pp.text(core.pp_var(v, context)),
+        core.pp_var(v, context),
     ])
   else:
     # pretty-print `y:T = swap x v i` as `y:T, x[i] <- x[i], v`
@@ -540,7 +555,7 @@ def _swap_pp_rule(eqn, context, settings) -> pp.Doc:
     y = core.pp_vars([y], context, print_shapes=settings.print_shapes)
     return pp.concat([y, pp.text(', '), x_i,
                       pp.text(' <- ', annotation=annotation), x_i,
-                      pp.text(', '), pp.text(core.pp_var(v, context))])
+                      pp.text(', '), core.pp_var(v, context)])
 core.pp_eqn_rules[swap_p] = _swap_pp_rule
 
 def _addupdate_pp_rule(eqn, context, settings) -> pp.Doc:
@@ -553,7 +568,7 @@ def _addupdate_pp_rule(eqn, context, settings) -> pp.Doc:
   return pp.concat([
       pp_ref_transforms(context, x, transforms),
       pp.text(" += ", annotation=annotation),
-      pp.text(core.pp_var(v, context)),
+      core.pp_var(v, context),
   ])
 core.pp_eqn_rules[addupdate_p] = _addupdate_pp_rule
 
@@ -751,7 +766,7 @@ def _batch_indexer(
           new_indices.append(idx)
           continue
         dim = dim.start
-        if dim is batching.not_mapped:
+        if dim is None:
           # Broadcasting the slice is free (the start index stays the same)
           new_indices.append(idx)
         else:
@@ -760,14 +775,10 @@ def _batch_indexer(
       else:
         # Check if we are indexing with a scalar or not. If we are indexing
         # with a scalar and we are not batched, we can avoid broadcasting it.
-        assert hasattr(idx, "shape")
-        if not idx.shape:
-          if dim is not batching.not_mapped:
-            assert idx.shape == (axis_size,)
-            idx = lax.broadcast_in_dim(idx, new_integer_indexer_shape, (0,))
+        if not shapeof(idx):
           new_indices.append(idx)
         else:
-          if dim is batching.not_mapped:
+          if dim is None:
             bcast_dims = tuple(range(1, np.ndim(idx) + 1))
             idx = lax.broadcast_in_dim(idx, new_integer_indexer_shape,
                                        bcast_dims)
@@ -775,30 +786,36 @@ def _batch_indexer(
             idx = batching.moveaxis(idx, dim, 0)
           new_indices.append(idx)
     else:
-      if ref_dim is not batching.not_mapped:
+      if ref_dim is not None:
         if not isinstance(idx, indexing.Slice):
-          assert hasattr(idx, "shape")
-          if idx.shape:
-            bcast_dims = tuple(range(1, np.ndim(idx) + 1))
+          if shapeof(idx):
+            bcast_dims = tuple(range(1, core.typeof(idx).ndim + 1))
             idx = lax.broadcast_in_dim(idx, new_integer_indexer_shape,
-                                      bcast_dims)
+                                       bcast_dims)
       new_indices.append(idx)
-  if ref_dim is not batching.not_mapped:
-    if indexer.int_indexer_shape:
-      batch_idx = lax.broadcasted_iota(
-          np.dtype('int32'), new_integer_indexer_shape, 0)
-    else:
+
+  # if the ref is batched, we must insert an indexer for that new axis
+  if ref_dim is not None:
+    # sometimes can optimize to generate a slice(None) on the batch axis.
+    # NOTE this optimization has caused much pain. if in doubt, try removing.
+    if not idx_is_batched and not indexer.int_indexer_shape:
       batch_idx = indexing.Slice(0, axis_size)
       new_integer_indexer_shape = ()
-
+    else:
+      batch_idx = lax.broadcasted_iota(
+          np.dtype('int32'), new_integer_indexer_shape, 0)
     new_indices.insert(ref_dim, batch_idx)
+
   return indexing.NDIndexer(
       tuple(new_indices), ref_shape, new_integer_indexer_shape, validate=True
   )
 
+def shapeof(x):
+  return x.shape if isinstance(x, TransformedRef) else core.typeof(x).shape
+
 def _get_vmap(batched_args, batched_dims, *, tree):
   axis_size, = {x.shape[d] for x, d in zip(batched_args, batched_dims)
-                if d is not batching.not_mapped}
+                if d is not None}
   ref, *flat_idxs = batched_args
   ref_dim, *flat_idx_dims = batched_dims
   indexers = tree_util.tree_unflatten(tree, flat_idxs)
@@ -806,7 +823,7 @@ def _get_vmap(batched_args, batched_dims, *, tree):
     return get_p.bind(ref, *flat_idxs, tree=tree), ref_dim
   indexers_dims = tree_util.tree_unflatten(tree, flat_idx_dims)
 
-  idx_is_batched = any(i_dim is not batching.not_mapped
+  idx_is_batched = any(i_dim is not None
                        for i_dim in flat_idx_dims)
   if len(indexers) > 1:
     raise NotImplementedError("Batching with multiple indexers not supported.")
@@ -823,7 +840,7 @@ def _get_vmap(batched_args, batched_dims, *, tree):
   )
   # Note: _batch_indexer will add a slice for the batch dim if the int_indexer
   # shape is empty, else it will use advanced/int indexing.
-  will_add_int_batcher = bool(indexers[0].int_indexer_shape)
+  will_add_int_batcher = ref_dim is not None and (idx_is_batched or indexers[0].int_indexer_shape)
 
   is_new_int_indexing, _, _ = indexing.unpack_ndindexer(new_indexers[0])
   new_int_indexers_contiguous = bool(
@@ -848,7 +865,7 @@ def _get_vmap(batched_args, batched_dims, *, tree):
     out = lax.transpose(out, transpose_order)
     out_bdim = 0
   else:
-    if ref_dim is not batching.not_mapped:
+    if ref_dim is not None:
       if will_add_int_batcher:
         if not int_indexers_contiguous:
           # In this case the indexer is always moved to the front.
@@ -859,14 +876,12 @@ def _get_vmap(batched_args, batched_dims, *, tree):
       else:
         # We only trigger this case when the int_indexer shape is empty,
         # so we don't need to account for int_indexer_shape.
-        int_indexers_before_ref_dim = int(np.sum(is_new_int_indexing[:ref_dim]))
+        int_indexers_before_ref_dim = sum(is_new_int_indexing[:ref_dim])
         out_bdim = ref_dim - int_indexers_before_ref_dim
     else:
       out_bdim = 0
-      if any(is_int_indexing):
-        # The batch dim is the indexer's batch dim.
-        original_pos = is_int_indexing.index(True)
-        out_bdim = original_pos
+      if new_int_indexers_contiguous:
+        out_bdim = is_new_int_indexing.index(True)
   return out, out_bdim
 batching.primitive_batchers[get_p] = _get_vmap
 
@@ -876,9 +891,9 @@ def _swap_vmap(axis_data, batched_args, batched_dims, *, tree):
   indexers = tree_util.tree_unflatten(tree, flat_idxs)
   indexers_dims = tree_util.tree_unflatten(tree, flat_idx_dims)
 
-  ref_is_batched = ref_dim is not batching.not_mapped
-  val_is_batched = val_dim is not batching.not_mapped
-  idx_is_batched = any(i_dim is not batching.not_mapped
+  ref_is_batched = ref_dim is not None
+  val_is_batched = val_dim is not None
+  idx_is_batched = any(i_dim is not None
                        for i_dim in flat_idx_dims)
 
   if not ref_is_batched:
@@ -895,8 +910,8 @@ def _swap_vmap(axis_data, batched_args, batched_dims, *, tree):
     raise NotImplementedError("Batching with multiple indexers not supported.")
   # TODO(sharadmv): handle vmap of multiple indexers
   new_indexers = tuple(_batch_indexer(indexer, dims, axis_data.size,
-                                  ref.shape, ref_dim, idx_is_batched)
-                     for indexer, dims in zip(indexers, indexers_dims))
+                                      ref.shape, ref_dim, idx_is_batched)
+                       for indexer, dims in zip(indexers, indexers_dims))
   flat_indexers, tree = tree_util.tree_flatten(new_indexers)
 
   is_int_indexing, _, _ = indexing.unpack_ndindexer(indexers[0])
@@ -908,26 +923,34 @@ def _swap_vmap(axis_data, batched_args, batched_dims, *, tree):
       np.all(np.diff(np.where(is_new_int_indexing)[0]) == 1)
   )
 
-  if not new_int_indexers_contiguous:  # will be moved to the front
-    batched_dim_in_result = 0
+  # Note: _batch_indexer will add a slice for the batch dim if the int_indexer
+  # shape is empty, else it will use advanced/int indexing.
+  will_add_int_batcher = idx_is_batched or indexers[0].int_indexer_shape
+
+  if not new_int_indexers_contiguous and will_add_int_batcher:
+    batched_dim_in_result = 0  # will be moved to the front
+  elif any(is_new_int_indexing):
+    if will_add_int_batcher:
+      # _batch_indexer ensures the bdim in the int indexers is at the front
+      batched_dim_in_result = is_new_int_indexing.index(True)
+    else:
+      # all int indices are scalars, so the ones before ref_dim disappear
+      assert ref_dim is not None
+      batched_dim_in_result = ref_dim - sum(is_new_int_indexing[:ref_dim])
   else:
-    try:
-      batched_dim_in_result = is_new_int_indexing.index(True) + 0
-    except ValueError:
-      batched_dim_in_result = ref_dim
+    batched_dim_in_result = ref_dim
 
   if not val_is_batched:
     if ref_is_batched or idx_is_batched:
       val = batching.broadcast(val, axis_data.size, batched_dim_in_result,
                                axis_data.explicit_mesh_axis)
   else:
+    assert batched_dim_in_result is not None
     val = batching.moveaxis(val, val_dim, batched_dim_in_result)
 
+  # Originally not going to be moved to front, but now will be moved to front.
   transpose_order_inversed = None
-
-  # Originally not going to be moved to the front, but now going to be moved to
-  # the front.
-  if int_indexers_contiguous and not new_int_indexers_contiguous:
+  if int_indexers_contiguous and not new_int_indexers_contiguous and will_add_int_batcher:
     original_pos = is_int_indexing.index(True)
     array_indexer_shape = new_indexers[0].int_indexer_shape
     array_indexer_len = len(array_indexer_shape)
@@ -959,9 +982,9 @@ def _addupdate_vmap(axis_data, batched_args, batched_dims, *, tree):
   indexers = tree_util.tree_unflatten(tree, flat_idxs)
   indexers_dims = tree_util.tree_unflatten(tree, flat_idx_dims)
 
-  ref_is_batched = ref_dim is not batching.not_mapped
-  val_is_batched = val_dim is not batching.not_mapped
-  idx_is_batched = any(i_dim is not batching.not_mapped
+  ref_is_batched = ref_dim is not None
+  val_is_batched = val_dim is not None
+  idx_is_batched = any(i_dim is not None
                        for i_dim in flat_idx_dims)
 
   if not ref_is_batched:
@@ -978,8 +1001,8 @@ def _addupdate_vmap(axis_data, batched_args, batched_dims, *, tree):
 
   # TODO(sharadmv): handle vmap of multiple indexers
   new_indexers = tuple(_batch_indexer(indexer, dims, axis_data.size,
-                                  ref.shape, ref_dim, idx_is_batched)
-                     for indexer, dims in zip(indexers, indexers_dims))
+                                      ref.shape, ref_dim, idx_is_batched)
+                       for indexer, dims in zip(indexers, indexers_dims))
   flat_indexers, tree = tree_util.tree_flatten(new_indexers)
 
   is_int_indexing, _, _ = indexing.unpack_ndindexer(indexers[0])
@@ -991,24 +1014,34 @@ def _addupdate_vmap(axis_data, batched_args, batched_dims, *, tree):
       np.all(np.diff(np.where(is_new_int_indexing)[0]) == 1)
   )
 
-  if not new_int_indexers_contiguous:  # will be moved to the front
-    batched_dim_in_result = 0
-  else:
-    try:
+  # Note: _batch_indexer will add a slice for the batch dim if the int_indexer
+  # shape is empty, else it will use advanced/int indexing.
+  will_add_int_batcher = idx_is_batched or indexers[0].int_indexer_shape
+
+  if not new_int_indexers_contiguous and will_add_int_batcher:
+    batched_dim_in_result = 0  # will be moved to the front
+  elif any(is_new_int_indexing):
+    if will_add_int_batcher:
+      # _batch_indexer ensures the bdim in the int indexers is at the front
       batched_dim_in_result = is_new_int_indexing.index(True)
-    except ValueError:
-      batched_dim_in_result = ref_dim
+    else:
+      # all int indices are scalars, so the ones before ref_dim disappear
+      assert ref_dim is not None
+      batched_dim_in_result = ref_dim - sum(is_new_int_indexing[:ref_dim])
+  else:
+    batched_dim_in_result = ref_dim
 
   if not val_is_batched:
     if ref_is_batched or idx_is_batched:
       val = batching.broadcast(val, axis_data.size, batched_dim_in_result,
                                axis_data.explicit_mesh_axis)
   else:
+    assert batched_dim_in_result is not None
     val = batching.moveaxis(val, val_dim, batched_dim_in_result)
 
   # Originally not going to be moved to the front, but now going to be moved to
   # the front.
-  if int_indexers_contiguous and not new_int_indexers_contiguous:
+  if int_indexers_contiguous and not new_int_indexers_contiguous and will_add_int_batcher:
     original_pos = is_int_indexing.index(True)
     array_indexer_shape = new_indexers[0].int_indexer_shape
     array_indexer_len = len(array_indexer_shape)
@@ -1131,10 +1164,11 @@ def _create_linear_abstract_eval(*, ty, memory_space):
 
 def _lower_create_linear(ctx):
   out_aval, = ctx.avals_out
+  flat_res_types, _ = mlir.ir_tree_registry.flatten(mlir.aval_to_ir_types(ctx.module_context, out_aval))
   return mlir.custom_call(
       "CreateBuffer",
       operands=[],
-      result_types=mlir.flatten_ir_types(mlir.aval_to_ir_types(out_aval)),
+      result_types=flat_res_types,
   ).results
 mlir.register_lowering(create_linear_p, _lower_create_linear)
 
@@ -1166,10 +1200,12 @@ def _lower_pin(ctx, x_op, *, to):
   else:
     config = {}
   out_aval, = ctx.avals_out
+  flat_ops, _ = mlir.ir_tree_registry.flatten([x_op])
+  flat_res_types, _ = mlir.ir_tree_registry.flatten(mlir.aval_to_ir_types(ctx.module_context, out_aval))
   return mlir.custom_call(
       "Pin",
-      operands=mlir.flatten_ir_values([x_op]),
-      result_types=mlir.flatten_ir_types(mlir.aval_to_ir_types(out_aval)),
+      operands=flat_ops,
+      result_types=flat_res_types,
       **config,
   ).results
 mlir.register_lowering(pin_p, _lower_pin)
@@ -1186,10 +1222,12 @@ def _unpin_abstract_eval(aval):
 
 def _lower_unpin(ctx, x_op):
   out_aval, = ctx.avals_out
+  flat_ops, _ = mlir.ir_tree_registry.flatten([x_op])
+  flat_res_types, _ = mlir.ir_tree_registry.flatten(mlir.aval_to_ir_types(ctx.module_context, out_aval))
   return mlir.custom_call(
       "Unpin",
-      operands=mlir.flatten_ir_values([x_op]),
-      result_types=mlir.flatten_ir_types(mlir.aval_to_ir_types(out_aval)),
+      operands=flat_ops,
+      result_types=flat_res_types,
   ).results
 mlir.register_lowering(unpin_p, _lower_unpin)
 

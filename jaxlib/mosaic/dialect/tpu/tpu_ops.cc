@@ -17,14 +17,12 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/strings/str_format.h"
-#include "absl/strings/str_join.h"
 #include "llvm/ADT/FloatingPointMode.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -828,7 +826,7 @@ LogicalResult VectorStoreOp::verify() {
   return verifyStoreOp(*this);
 }
 
-void VectorStoreOp::build(OpBuilder &builder, OperationState &state,
+void VectorStoreOp::build(OpBuilder& builder, OperationState& state,
                           Value valueToStore, Value base, ValueRange indices,
                           Value mask, bool add) {
   build(builder, state, valueToStore, base, indices,
@@ -873,7 +871,7 @@ LogicalResult VectorLoadOp::verify() {
   return verifyLoadOp(*this);
 }
 
-void VectorLoadOp::build(OpBuilder &builder, OperationState &state,
+void VectorLoadOp::build(OpBuilder& builder, OperationState& state,
                          Type result_type, Value base, ValueRange indices,
                          Value mask) {
   build(builder, state, result_type, base, indices,
@@ -924,6 +922,21 @@ LogicalResult VectorStoreIdxOp::verify() {
   return verifyStoreOp(*this);
 }
 
+void ReinterpretCastOp::build(OpBuilder& builder, OperationState& state,
+                              Type result_type, Value input,
+                              Value dynamic_offset, ValueRange dynamic_sizes) {
+  state.addOperands(input);
+  if (dynamic_offset) {
+    state.addOperands(dynamic_offset);
+  }
+  state.addOperands(dynamic_sizes);
+  state.addAttribute("operandSegmentSizes",
+                     builder.getDenseI32ArrayAttr(
+                         {1, dynamic_offset ? 1 : 0,
+                          static_cast<int32_t>(dynamic_sizes.size())}));
+  state.addTypes(result_type);
+}
+
 LogicalResult ReinterpretCastOp::verify() {
   auto source_type = getMemRefType(getInput());
   auto target_type = getType();
@@ -931,6 +944,13 @@ LogicalResult ReinterpretCastOp::verify() {
     return emitOpError("Source and target memory spaces must match, but got ")
            << source_type.getMemorySpace() << " and "
            << target_type.getMemorySpace();
+  }
+  int64_t num_dynamic_dims = target_type.getNumDynamicDims();
+  if (static_cast<int64_t>(getDynamicSizes().size()) != num_dynamic_dims) {
+    return emitOpError("expected ")
+           << num_dynamic_dims
+           << " dynamic size(s) for the result type, but got "
+           << getDynamicSizes().size();
   }
   return success();
 }
@@ -1156,6 +1176,11 @@ LogicalResult MatmulOp::verify() {
                                    std::vector<bool>& seen_dims,
                                    const std::string_view operand) {
       for (int64_t dim : dims) {
+        if (dim < 0 || dim >= seen_dims.size()) {
+          emitOpError("Illegal: Dim ")
+              << dim << " is out of bounds for " << operand;
+          return failure();
+        }
         if (seen_dims[dim]) {
           emitOpError("Illegal: Dim ")
               << dim << " repeats in dimension numbers of " << operand;
@@ -1367,6 +1392,13 @@ LogicalResult GetBarrierSemaphoreOp::verify() {
   return success();
 }
 
+void SemaphoreSignalOp::build(OpBuilder& builder, OperationState& state,
+                              Value semaphore, Value amount, Value device_id,
+                              Value core_id) {
+  build(builder, state, semaphore, amount, device_id, core_id,
+        /*subcore_id=*/nullptr);
+}
+
 mlir::tpu::CoreType SemaphoreSignalOp::getTargetCoreType() {
   return getRefCoreType(getSemaphore()).value_or(GetCoreTypeOfParentOp(**this));
 }
@@ -1389,6 +1421,13 @@ LogicalResult SemaphoreSignalOp::verify() {
                           stringifyCoreType(issuing_core_type)));
     }
   }
+  // Subcore ID applies only to SC vector subcore semaphore ops.
+  if (target_core_type != CoreType::kScVectorSubcore &&
+      getSubcoreId() != nullptr) {
+    return emitOpError(
+        "Subcore id should not be set unless target core type is SC vector "
+        "subcore");
+  }
   return success();
 }
 
@@ -1400,29 +1439,43 @@ LogicalResult SemaphoreWaitOp::verify() {
   return success();
 }
 
+void EnqueueDMAOp::build(OpBuilder& builder, OperationState& state,
+                         Value source, Value source_semaphore, Value target,
+                         Value target_semaphore, Value device_id, Value core_id,
+                         uint32_t priority, bool strict_ordering) {
+  build(builder, state, source, source_semaphore, target, target_semaphore,
+        device_id, core_id, /*subcore_id=*/nullptr, priority, strict_ordering);
+}
 mlir::tpu::CoreType EnqueueDMAOp::getTargetCoreType() {
   return getRefCoreType(getTargetSemaphore())
       .value_or(GetCoreTypeOfParentOp(**this));
 }
 
 LogicalResult EnqueueDMAOp::verify() {
-  auto target_sem_type = getMemRefType(getTargetSemaphore());
+  Value target_sem = getTargetSemaphore();
+  if (!target_sem) {
+    // TODO: b/501204503 - Support optional source and destination semaphores.
+    return emitOpError("EnqueueDMA target semaphore must be provided.");
+  }
+  MemRefType target_sem_type = getMemRefType(target_sem);
   if (target_sem_type.getRank() != 0) {
     return emitOpError("DMA target semaphore must be rank 0");
   }
-  auto source_sem = getSourceSemaphore();
+  Type target_sem_elem_type = target_sem_type.getElementType();
+
+  Value source_sem = getSourceSemaphore();
   if (source_sem) {
-    auto source_sem_type = getMemRefType(getSourceSemaphore());
+    MemRefType source_sem_type = getMemRefType(source_sem);
     if (source_sem_type.getRank() != 0) {
       return emitOpError("DMA source semaphore reference must be rank 0");
     }
-    if (source_sem_type.getElementType() != target_sem_type.getElementType()) {
+    if (source_sem_type.getElementType() != target_sem_elem_type) {
       return emitOpError(
           "DMA source and target semaphore must have the same type");
     }
   }
-  auto source_ty = getMemRefType(getSource());
-  auto target_ty = getMemRefType(getTarget());
+  MemRefType source_ty = getMemRefType(getSource());
+  MemRefType target_ty = getMemRefType(getTarget());
   if (source_ty.getElementType() != target_ty.getElementType()) {
     return emitOpError("DMA source and target element type mismatch");
   }
@@ -1439,6 +1492,7 @@ LogicalResult EnqueueDMAOp::verify() {
   }
   bool is_remote = getDeviceId() || getCoreId();
   if (getSourceSemaphore()) {
+    // TODO: b/501204503 - Support optional source and destination semaphores.
     if (!is_remote) {
       return emitOpError(
           "DMA destination device_id or core_id must be specified when source "
@@ -1476,221 +1530,33 @@ LogicalResult EnqueueDMAOp::verify() {
         "Strict ordering is only supported on the SC scalar and vector "
         "subcores");
   }
-  if (isa<SemaphoreType>(target_sem_type.getElementType())) {
+  if (isa<SemaphoreType>(target_sem_elem_type)) {
     if (HasMemorySpace(source_ty, MemorySpace::kSmem) ||
         HasMemorySpace(target_ty, MemorySpace::kSmem)) {
       return emitOpError(
           "Non-DMA semaphores are not supported for DMAs involving SMEM");
     }
   }
-  return success();
-}
-
-LogicalResult EnqueueIndirectDMAOp::verifyGather(
-    MemRefType operand_ty, ArrayRef<int64_t> offsets_shape,
-    MemRefType result_ty) {
-  // Expected shapes:
-  //   Slice shape   : [s0, ..., sm]
-  //
-  //   1D offsets:
-  //     Operand shape : [z, s0, ..., sm]
-  //     Offsets shape : [o]
-  //     Result shape  : [o, s0, ..., sm]
-  //
-  //   2D offsets:
-  //     Operand shape : [1, z, s0, ..., sm]
-  //     Offsets shape : [1, o]
-  //     Result shape  : [1, o, s0, ..., sm]
-
-  // We've already thrown an error if the target is not VMEM. so this is just a
-  // sanity check.
-  CHECK(HasMemorySpace(result_ty, MemorySpace::kVmem));
-  uint64_t offsets_rank = offsets_shape.size();
-  uint64_t slice_rank = result_ty.getRank() - offsets_rank;
-  if (operand_ty.getRank() <= slice_rank) {
-    return emitOpError("Source (gather operand) rank must be > slice rank, ")
-           << "got source rank: " << operand_ty.getRank()
-           << ", slice rank: " << slice_rank;
-  }
-  uint64_t operand_sample_rank = operand_ty.getRank() - slice_rank;
-  ArrayRef<int64_t> result_offset_dims =
-      result_ty.getShape().take_front(offsets_rank);
-  ArrayRef<int64_t> result_slice_dims =
-      result_ty.getShape().take_back(slice_rank);
-  ArrayRef<int64_t> operand_slice_dims =
-      operand_ty.getShape().take_back(slice_rank);
-  ArrayRef<int64_t> operand_sample_dims =
-      operand_ty.getShape().take_front(operand_sample_rank);
-
-  // We require offsets shape and operand sample shape to be 1D or (1, N), and
-  // their ranks must match.
-  // Offsets shape : [o] or [1, o]
-  // Operand sample shape : [z] or [1, z]
-  if (offsets_rank > 2 ||
-      (offsets_rank == 2 && offsets_shape[0] != 1)) {
-    return emitOpError("Offsets shape must be 1D or (1, N), got (")
-           << absl::StrJoin(offsets_shape, ", ") << ")";
-  }
-  if (operand_sample_rank > 2 ||
-      (operand_sample_rank == 2 && operand_sample_dims[0] != 1)) {
-    return emitOpError("Source (gather operand) sample shape must be ")
-           << "1D or (1, N), got ("
-           << absl::StrJoin(operand_sample_dims, ", ") << ")";
-  }
-  if (operand_sample_rank != offsets_rank) {
-    return emitOpError("Source (gather operand) sample rank must match ")
-           << "offsets rank, got " << operand_sample_rank
-           << " vs " << offsets_rank;
-  }
-
-  const std::string result_shape_str =
-      absl::StrJoin(result_ty.getShape(), ", ");
-
-  // Make sure that there is one output slice per offset.
-  // Offsets shape : [o] or [1, o]
-  // Result shape  : [o'0, .., o'p, s0, .., sm]
-  // [o] or [1, o] == [o'0, .., o'p]
-  if (!absl::c_equal(offsets_shape, result_offset_dims)) {
-    return emitOpError("Offsets shape (")
-           << absl::StrJoin(offsets_shape, ", ")
-           << ") must match the majormost dimensions of the target (gather "
-              "result) shape ("
-           << result_shape_str << ")";
-  }
-
-  // At each offset, we are copying an ND slice of data. Make sure that the
-  // slice shape is the same in the operand and the output for the gather.
-  // Operand shape : [z, s0, .., sm] or [1, z, s0, .., sm]
-  // Result shape :  [o, s'0, .., s'm] or [1, o, s'0, .., s'm]
-  // [s0, .., sm] == [s'0, .., s'm]
-  if (!absl::c_equal(operand_slice_dims, result_slice_dims)) {
-    const std::string plural = slice_rank == 1 ? "" : "s";
-    return emitOpError(absl::StrFormat(
-        "%d minormost dimension%s of the source (gather operand) shape (%s) "
-        "must match the minormost dimension%s of the target (gather result) "
-        "shape (%s)",
-        slice_rank, plural, absl::StrJoin(operand_ty.getShape(), ", "), plural,
-        result_shape_str));
+  // Subcore ID applies only to SC vector subcore DMAs.
+  if (target_core != CoreType::kScVectorSubcore && getSubcoreId() != nullptr) {
+    return emitOpError(
+        "Subcore id should not be set unless target core type is SC vector "
+        "subcore");
   }
   return success();
-}
-
-LogicalResult EnqueueIndirectDMAOp::verifyScatter(
-    MemRefType updates_ty, ArrayRef<int64_t> offsets_shape,
-    MemRefType operand_ty) {
-  // Expected shapes:
-  //   Slice shape   : [s0, ..., sm]
-  //
-  //   1D offsets:
-  //     Operand shape : [z, s0, ..., sm]
-  //     Offsets shape : [o]
-  //     Updates shape : [o, s0, ..., sm]
-  //
-  //   2D offsets:
-  //     Operand shape : [1, z, s0, ..., sm]
-  //     Offsets shape : [1, o]
-  //     Updates shape : [1, o, s0, ..., sm]
-
-  // We've already thrown an error if the source is not VMEM. so this is just a
-  // sanity check.
-  CHECK(HasMemorySpace(updates_ty, MemorySpace::kVmem));
-  uint64_t offsets_rank = offsets_shape.size();
-  uint64_t slice_rank = updates_ty.getRank() - offsets_rank;
-  if (operand_ty.getRank() <= slice_rank) {
-    return emitOpError("Target (scatter operand) rank must be > slice rank, ")
-           << "got target rank: " << operand_ty.getRank()
-           << ", slice rank: " << slice_rank;
-  }
-  uint64_t operand_sample_rank = operand_ty.getRank() - slice_rank;
-  ArrayRef<int64_t> updates_offset_dims =
-      updates_ty.getShape().take_front(offsets_rank);
-  ArrayRef<int64_t> updates_slice_dims =
-      updates_ty.getShape().take_back(slice_rank);
-  ArrayRef<int64_t> operand_slice_dims =
-      operand_ty.getShape().take_back(slice_rank);
-  ArrayRef<int64_t> operand_sample_dims =
-      operand_ty.getShape().take_front(operand_sample_rank);
-
-  // We require offsets shape and operand sample shape to be 1D or (1, N), and
-  // their ranks must match.
-  // Offsets shape : [o] or [1, o]
-  // Operand sample shape : [z] or [1, z]
-  if (offsets_rank > 2 ||
-      (offsets_rank == 2 && offsets_shape[0] != 1)) {
-    return emitOpError("Offsets shape must be 1D or (1, N), got (")
-           << absl::StrJoin(offsets_shape, ", ") << ")";
-  }
-  if (operand_sample_rank > 2 ||
-      (operand_sample_rank == 2 && operand_sample_dims[0] != 1)) {
-    return emitOpError("Target (scatter operand) sample shape must be ")
-           << "1D or (1, N), got ("
-           << absl::StrJoin(operand_sample_dims, ", ") << ")";
-  }
-  if (operand_sample_rank != offsets_rank) {
-    return emitOpError("Target (scatter operand) sample rank must match ")
-           << "offsets rank, got " << operand_sample_rank
-           << " vs " << offsets_rank;
-  }
-
-  const std::string updates_shape_str =
-      absl::StrJoin(updates_ty.getShape(), ", ");
-
-  // Make sure that there is one slice of updates per offset.
-  // Offsets shape : [o] or [1, o]
-  // Updates shape : [o'0, .., o'p, s0, .., sm]
-  // [o] or [1, o] == [o'0, .., o'p]
-  if (!absl::c_equal(offsets_shape, updates_offset_dims)) {
-    return emitOpError("Offsets shape (")
-           << absl::StrJoin(offsets_shape, ", ")
-           << ") must match the majormost dimensions of the source "
-              "(scatter updates) shape ("
-           << updates_shape_str << ")";
-  }
-
-  // At each offset, we are copying an ND slice of data. Make sure that the
-  // slice shape is the same in the updates and the operand for the scatter.
-  // Updates shape : [o, s0, .., sm] or [1, o, s0, .., sm]
-  // Operand shape : [z, s'0, .., s'm] or [1, z, s'0, .., s'm]
-  // [s0, .., sm] == [s'0, .., s'm]
-  if (!absl::c_equal(operand_slice_dims, updates_slice_dims)) {
-    const std::string plural = slice_rank == 1 ? "" : "s";
-    return emitOpError(absl::StrFormat(
-        "%d minormost dimension%s of the source (scatter updates) shape (%s) "
-        "must match the minormost dimension%s of the target (scatter operand) "
-        "shape (%s)",
-        slice_rank, plural, updates_shape_str, plural,
-        absl::StrJoin(operand_ty.getShape(), ", ")));
-  }
-  return success();
-}
-
-namespace {
-bool hasHbmOrTcVmemOrVmemSharedMemorySpace(MemRefType ty) {
-  return HasMemorySpace(ty, MemorySpace::kHbm) ||
-         HasMemorySpace(ty, MemorySpace::kVmem, CoreType::kTc) ||
-         HasMemorySpace(ty, MemorySpace::kVmemShared);
-}
-}  // namespace
-
-FailureOr<bool> isGather(Operation& op, MemRefType source_ty,
-                         MemRefType target_ty) {
-  if (hasHbmOrTcVmemOrVmemSharedMemorySpace(source_ty) &&
-      HasMemorySpace(target_ty, MemorySpace::kVmem)) {
-    return true;
-  }
-  if (HasMemorySpace(source_ty, MemorySpace::kVmem) &&
-      hasHbmOrTcVmemOrVmemSharedMemorySpace(target_ty)) {
-    return false;
-  }
-  return op.emitOpError(
-      "The transfer must be between HBM and VMEM, or between VMEM_SHARED and "
-      "VMEM");
 }
 
 FailureOr<bool> EnqueueIndirectDMAOp::isGather() {
-  const MemRefType source_ty = getMemRefType(getSource());
-  const MemRefType target_ty = getMemRefType(getTarget());
-  return mlir::tpu::isGather(*getOperation(), source_ty, target_ty);
+  const auto source_ms = dyn_cast_if_present<MemorySpaceAttr>(
+      getMemRefType(getSource()).getMemorySpace());
+  const auto target_ms = dyn_cast_if_present<MemorySpaceAttr>(
+      getMemRefType(getTarget()).getMemorySpace());
+  if (source_ms == nullptr || target_ms == nullptr) {
+    return emitOpError("Source and target memory spaces must be provided");
+  }
+  return mlir::tpu::isGather(*getOperation(), source_ms.getValue(),
+                             source_ms.getCoreType(), target_ms.getValue(),
+                             target_ms.getCoreType());
 }
 
 LogicalResult EnqueueIndirectDMAOp::verify() {
@@ -1730,13 +1596,13 @@ LogicalResult EnqueueIndirectDMAOp::verify() {
   }
 
   if (is_gather) {
-    return verifyGather(/*operand_ty=*/source_ty,
+    return verifyGather(getOperation(), /*operand_shape=*/source_ty.getShape(),
                         /*offsets_shape=*/offsets_shape,
-                        /*result_ty=*/target_ty);
+                        /*results_memory_space=*/target_ty.getShape());
   }
-  return verifyScatter(/*updates_ty=*/source_ty,
+  return verifyScatter(getOperation(), /*updates_ty=*/source_ty.getShape(),
                        /*offsets_shape=*/offsets_shape,
-                       /*operand_ty=*/target_ty);
+                       /*operand_ty=*/target_ty.getShape());
 }
 
 void WaitDMA2Op::build(OpBuilder& builder, OperationState& state,
@@ -1759,10 +1625,46 @@ LogicalResult WaitDMA2Op::verify() {
   return success();
 }
 
+LogicalResult WaitDMAOp::verify() {
+  bool wait_destination = getWaitTarget();
+  TypedValue<MemRefType> sem =
+      wait_destination ? getTargetSemaphore() : getSourceSemaphore();
+  if (!sem) {
+    // TODO: b/501204503 - Support optional source and destination semaphores
+    // with global reserved semaphore allocation tracking.
+    return emitOpError("The awaited semaphore must be provided");
+  }
+
+  if (getMemRefType(sem).getRank() != 0) {
+    return emitOpError("DMA wait semaphore must be rank 0");
+  }
+
+  CoreType issuing_core = GetCoreTypeOfParentOp(**this);
+  if (getRefCoreType(sem).value_or(issuing_core) != issuing_core) {
+    return emitOpError("Can only await semaphores attached to the local core");
+  }
+
+  // Subcore ID applies only to SC vector subcore.
+  if (issuing_core != CoreType::kScVectorSubcore && getSubcoreId() != nullptr) {
+    return emitOpError(
+        "Subcore id should not be set unless issuing core type is SC vector "
+        "subcore");
+  }
+
+  return success();
+}
+
 FailureOr<bool> WaitIndirectDMAOp::isGather() {
-  const MemRefType source_ty = getMemRefType(getSrc());
-  const MemRefType target_ty = getMemRefType(getDst());
-  return mlir::tpu::isGather(*getOperation(), source_ty, target_ty);
+  const auto source_ms = dyn_cast_if_present<MemorySpaceAttr>(
+      getMemRefType(getSrc()).getMemorySpace());
+  const auto target_ms = dyn_cast_if_present<MemorySpaceAttr>(
+      getMemRefType(getDst()).getMemorySpace());
+  if (source_ms == nullptr || target_ms == nullptr) {
+    return emitOpError("Source and target memory spaces must be provided");
+  }
+  return mlir::tpu::isGather(*getOperation(), source_ms.getValue(),
+                             source_ms.getCoreType(), target_ms.getValue(),
+                             target_ms.getCoreType());
 }
 
 LogicalResult WaitIndirectDMAOp::verify() {
@@ -2106,15 +2008,11 @@ LogicalResult PackMaskOp::verify() {
 namespace {
 LogicalResult verifyElementwisePacking(Operation* op, Type unpacked_ty,
                                        Type packed_ty) {
-  if (unpacked_ty.isF32() && !packed_ty.isBF16()) {
+  if (!(unpacked_ty.isF32() && packed_ty.isBF16()) &&
+      !(unpacked_ty.isSignlessInteger() && packed_ty.isSignlessInteger())) {
     return op->emitOpError(
-        "Only packing/unpacking between f32 and bf16 is supported for floats");
-  }
-  if (unpacked_ty.isSignlessInteger(32) && !packed_ty.isSignlessInteger(16) &&
-      !packed_ty.isSignlessInteger(8) && !packed_ty.isSignlessInteger(4)) {
-    return op->emitOpError(
-        "Only packing/unpacking between i32 and i16/i8/i4 is supported for "
-        "integers");
+        "Only packing/unpacking f32 <-> bf16 and integer <-> integer is "
+        "supported");
   }
   return success();
 }
@@ -2134,13 +2032,12 @@ LogicalResult PackElementwiseOp::verify() {
 
   auto src_elem_ty = src_vty.getElementType();
   auto tgt_elem_ty = getTargetType();
-  if (!(src_elem_ty.isF32() && tgt_elem_ty.isBF16()) &&
-      !(src_elem_ty.isSignlessInteger() && tgt_elem_ty.isSignlessInteger())) {
-    return emitOpError(
-        "Only packing f32 -> bf16 and integer -> integer is supported");
+  if (failed(verifyElementwisePacking(*this, /*unpacked_ty=*/src_elem_ty,
+                                      /*packed_ty=*/tgt_elem_ty))) {
+    return failure();
   }
   const int packing_factor =
-      getElementTypeBitwidth(src_vty) / getTypeBitwidth(getTargetType());
+      getElementTypeBitwidth(src_vty) / getTypeBitwidth(tgt_elem_ty);
   if (packing_factor != getSources().size()) {
     return emitOpError("The number of sources must match the packing factor (")
            << packing_factor << "), got " << getSources().size();
@@ -2149,7 +2046,9 @@ LogicalResult PackElementwiseOp::verify() {
 }
 
 LogicalResult UnpackElementwiseOp::verify() {
-  if (failed(verifyElementwisePacking(*this, getType(), getSourceType()))) {
+  if (failed(verifyElementwisePacking(
+          *this, /*unpacked_ty=*/getType().getElementType(),
+          /*packed_ty=*/getSourceType()))) {
     return failure();
   }
   const int packing_factor =
@@ -2459,8 +2358,7 @@ LogicalResult FetchAndAddSyncOp::verify() {
     case CoreType::kScScalarSubcore:
       return emitOpError("SC scalar subcore target not supported yet");
     default:
-      return emitOpError(
-                 "Only SC scalar and vector subcores are supported, got ")
+      return emitOpError("Only SC vector subcore is supported, got ")
              << target_core;
   }
   MemRefType base_type = getBase().getType();
@@ -2476,6 +2374,41 @@ LogicalResult FetchAndAddSyncOp::verify() {
   return success();
 }
 
+LogicalResult CoreIdOp::verify() {
+  Operation* parent = GetParentOpWithCoreType(**this);
+  if (parent == nullptr) {
+    return emitOpError("Failed to infer the core type from parent ops");
+  }
+  CoreType core_type = *TPUDialect::GetCoreTypeAttr(parent);
+  if (core_type == CoreType::kTc) {
+    return emitOpError("Unsupported core type: ") << core_type;
+  }
+  // Querying Core ID is not supported under dimension semantics.
+  if (auto func_op = getOperation()->getParentOfType<func::FuncOp>();
+      func_op != nullptr &&
+      func_op->getAttrOfType<ArrayAttr>("dimension_semantics") != nullptr) {
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult SubcoreIdOp::verify() {
+  Operation* parent = GetParentOpWithCoreType(**this);
+  if (parent == nullptr) {
+    return emitOpError("Failed to infer the core type from parent ops");
+  }
+  CoreType core_type = *TPUDialect::GetCoreTypeAttr(parent);
+  if (core_type == CoreType::kTc) {
+    return emitOpError("Unsupported core type: ") << core_type;
+  }
+  // Subcore ID is not supported under dimension semantics.
+  if (auto func_op = getOperation()->getParentOfType<func::FuncOp>();
+      func_op != nullptr &&
+      func_op->getAttrOfType<ArrayAttr>("dimension_semantics") != nullptr) {
+    return failure();
+  }
+  return success();
+}
 }  // namespace tpu
 }  // namespace mlir
 

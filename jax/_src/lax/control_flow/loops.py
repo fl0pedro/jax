@@ -33,44 +33,52 @@ from jax._src import dtypes
 from jax._src import effects
 from jax._src import hijax
 from jax._src import linear_util as lu
+from jax._src import sharding_impls as sharding
 from jax._src import source_info_util
 from jax._src import state
 from jax._src import util
-from jax._src.api_util import (
-    check_no_aliased_ref_args, _check_no_aliased_closed_over_refs,
+from jax._src import xla_bridge as xb
+from jax._src.api_util import ( _check_no_aliased_closed_over_refs,
+    check_no_aliased_ref_args,
     check_no_transformed_refs_args)
 from jax._src.core import (
-  ShapedArray, typeof, cur_qdd, ClosedJaxpr, AbstractValue)
+    AbstractValue,
+    ClosedJaxpr,
+    ShapedArray,
+    cur_qdd,
+    typeof,
+)
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import pxla
-from jax._src import sharding_impls as sharding
-from jax._src.mesh import use_abstract_mesh
 from jax._src.lax import lax
-from jax._src.lax import utils as lax_utils
+from jax._src.lax.eval_jaxpr import eval_jaxpr_p
 from jax._src.lax import slicing
+from jax._src.lax import utils as lax_utils
 from jax._src.lax import windowed_reductions
 from jax._src.lax.control_flow.common import (
-    _avals_short, _prune_zeros, _typecheck_param,
-    _make_closed_jaxpr)
+    _avals_short,
+    _make_closed_jaxpr, _prune_zeros, _typecheck_param)
 from jax._src.lax.other import logaddexp
-from jax._src.pjit import auto_axes, PartitionSpec as P, reshard
+from jax._src.lib import jaxlib_extension_version
 from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import hlo
+from jax._src.mesh import use_abstract_mesh
+from jax._src.pjit import PartitionSpec as P, auto_axes, reshard
 from jax._src.sharding_impls import canonicalize_sharding
-from jax._src.state import discharge as state_discharge, AbstractRef
+from jax._src.state import AbstractRef, discharge as state_discharge
 from jax._src.traceback_util import api_boundary
 from jax._src.tree_util import equality_errors
+from jax._src.tree_util import ( FlatTree,
+    keystr, tree_flatten, tree_map, tree_unflatten,
+    treedef_is_leaf)
 from jax._src.typing import Array
 from jax._src.util import (
     merge_lists, partition_list, safe_map, safe_zip, split_list,
-    split_list_checked, unzip2, weakref_lru_cache, subs_list)
-from jax._src import xla_bridge as xb
-from jax._src.tree_util import (
-    keystr, tree_flatten, tree_map, tree_unflatten,
-    treedef_is_leaf, FlatTree)
+    split_list_checked, subs_list, unzip2, weakref_lru_cache)
 import numpy as np
 
 _map = safe_map
@@ -492,7 +500,7 @@ def _infer_scan_length(
                            if not hasattr(x, 'shape')))) from err
 
   xs_shaped_avals = lax_utils.ensure_shaped(*xs_avals)
-  if not all(a.sharding.spec[0] is None for a in xs_shaped_avals):
+  if not all(a.sharding.spec.partitions[0] is None for a in xs_shaped_avals):
     raise ValueError('0th dimension of all xs should be replicated. Got '
                      f'{", ".join(str(a.sharding.spec) for a in xs_shaped_avals)}')
 
@@ -708,7 +716,7 @@ def _concat(a, b): return lax.concatenate([a, b], 0)
 
 def _empty_array(prefix, length_spec, aval):
   sharding = aval.sharding.update(spec=aval.sharding.spec.update(
-      partitions=(*length_spec, *aval.sharding.spec)))
+      partitions=(*length_spec, *aval.sharding.spec.partitions)))
   # TODO(yashkatariya): Replace `lax.empty2` with `lax.empty` once
   # AllocateBuffer issues are fixed. Also delete `empty2` after this usage is
   # removed. Basically uncomment the following 2 lines.
@@ -722,18 +730,6 @@ def _empty_array(prefix, length_spec, aval):
     out = lax.broadcast(empty, (*prefix, *aval.shape), out_sharding=sharding)
   return out
 
-eval_jaxpr_p = core.Primitive('eval_jaxpr')
-eval_jaxpr_p.multiple_results = True
-def _stage_jaxpr(trace: pe.DynamicJaxprTrace, source_info, *tracers,
-                 jaxpr: ClosedJaxpr):
-  params = dict(call_jaxpr=jaxpr)
-  return trace.default_process_primitive(core.closed_call_p, tracers, params,
-                                         source_info=source_info)
-pe.custom_staging_rules[eval_jaxpr_p] = _stage_jaxpr
-
-@eval_jaxpr_p.def_effectful_abstract_eval  # abstract eval only used for jax2tf
-def _stage_jaxpr_abstract_eval(*_, jaxpr):
-  return jaxpr.out_avals, jaxpr.effects
 
 def _scan_abstract_eval(*args, reverse, length, num_consts, num_carry, jaxpr,
                         unroll):
@@ -1091,7 +1087,8 @@ def _scan_transpose_fancy(cts, *args, reverse, length, num_consts,
 
   # initialize values to be used to accumulate pure constant gradients
   immut_const_avals = jaxpr.in_avals[num_ires+len(mut_consts_bar):num_consts]
-  ct_immut_consts = _map(ad_util.zeros_like_aval, immut_const_avals)
+  ct_immut_consts = _map(lambda a: ad_util.zeros_like_aval(a.to_ct_aval()),
+                         immut_const_avals)
 
   # prepare transpose inputs, unboxing RefAccums while noting which are linear
   trans_in, trans_tree = tree_flatten([ires, mut_consts_bar, ct_immut_consts,
@@ -1100,8 +1097,8 @@ def _scan_transpose_fancy(cts, *args, reverse, length, num_consts,
   trans_in = [x.inst().ref if l else x for l, x in zip(lin_refs, trans_in)]
 
   # prepare transposed jaxpr
-  accum_typeof = (lambda x: x.aval if isinstance(x, ad.GradAccum)
-                  else core.aval_qdd_from_current_val(typeof(x), x))
+  accum_typeof = lambda x: (x.aval if isinstance(x, ad.GradAccum)
+                            else core.aval_qdd_from_current_val(typeof(x), x))
   trans_avals, ext_avals = split_list(_map(accum_typeof, trans_in), [num_consts+num_carry])
   trans_avals = trans_avals + [core.mapped_leading_aval(length, a) for a in ext_avals]
   xs_avals = tuple(core.mapped_leading_aval(length, accum_typeof(x)) for x in immut_xs_dot)
@@ -1118,15 +1115,14 @@ def _scan_transpose_fancy(cts, *args, reverse, length, num_consts,
     if isinstance(a, ad.GradAccum): a.accum(x)
 
 # transpose_scan_jaxpr converts the jaxpr signature:
-#  Before: [(ires,  T d_mut     T d_pure), T c,  (CT a_mut, T a, eres)] -> [T c,  T b]
+#  Before: [(ires,  T d_mut     T d_pure), T c,  ( T a_mut, T a, eres)] -> [T c,  T b]
 #           ---------- consts -----------        --------- ext -------
 #
 #  After: [(ires, CT d_mut), (CT d_pure,  CT c), (CT a_mut, CT b, eres)] -> [(CT d_pure, CT c), CT a]
 #           --- consts ----  ----- carry ------  --------- ext --------
 @weakref_lru_cache
 def _transpose_scan_jaxpr_fancy(
-    jaxpr, trans_tree, trans_avals, lin_refs, immut_xs_avals
-) -> core.ClosedJaxpr:
+    jaxpr, trans_tree, trans_avals, lin_refs, immut_xs_avals) -> core.ClosedJaxpr:
   def transposed(*args):
     args = [ad.RefAccum(typeof(x).inner_aval, x) if l else x
             for l, x in zip(lin_refs, args)]
@@ -1142,14 +1138,13 @@ def _transpose_scan_jaxpr_fancy(
             if isinstance(x, ad.ValAccum)]
 
   dbg = jaxpr.jaxpr.debug_info.with_unknown_names()
-  transposed_wrapped = lu.wrap_init(transposed, debug_info=dbg)
-  return _make_closed_jaxpr(transposed_wrapped, trans_avals)
+  return _make_closed_jaxpr(transposed, trans_avals, dbg)
 
 
 def _scan_batching_rule(axis_data, args, dims, reverse, length, jaxpr,
                         num_consts, num_carry, unroll):
   num_ys = len(jaxpr.out_avals) - num_carry
-  orig_batched = [d is not batching.not_mapped for d in dims]
+  orig_batched = [d is not None for d in dims]
   const_batched, init_batched, xs_batched = split_list(orig_batched, [num_consts, num_carry])
 
   # Fixpoint computation of which carry are batched: either
@@ -1173,22 +1168,22 @@ def _scan_batching_rule(axis_data, args, dims, reverse, length, jaxpr,
 
   consts, init, xs = split_list(args, [num_consts, num_carry])
   consts_bdims, init_bdims, xs_bdims = split_list(dims, [num_consts, num_carry])
-  new_consts = [batching.moveaxis(x, d, 0) if d is not batching.not_mapped and d != 0
+  new_consts = [batching.moveaxis(x, d, 0) if d is not None and d != 0
                 else x for x, d in zip(consts, consts_bdims)]
   new_init = [batching.broadcast(x, axis_data.size, 0, axis_data.explicit_mesh_axis)
               if now_batched and not was_batched
               else batching.moveaxis(x, d, 0) if now_batched else x
               for x, d, was_batched, now_batched in
               zip(init, init_bdims, init_batched, carry_batched)]
-  new_xs = [batching.moveaxis(x, d, 1) if d is not batching.not_mapped and d != 1
+  new_xs = [batching.moveaxis(x, d, 1) if d is not None and d != 1
             else x for x, d in zip(xs, xs_bdims)]
   new_args = new_consts + new_init + new_xs
 
   outs = scan_p.bind(
       *new_args, reverse=reverse, length=length, jaxpr=jaxpr_batched,
       num_consts=num_consts, num_carry=num_carry, unroll=unroll)
-  carry_bdims = [0 if b else batching.not_mapped for b in carry_batched]
-  ys_bdims = [1 if b else batching.not_mapped for b in ys_batched]
+  carry_bdims = [0 if b else None for b in carry_batched]
+  ys_bdims = [1 if b else None for b in ys_batched]
   return outs, carry_bdims + ys_bdims
 
 def _scan_dce_rule(used_outputs: list[bool], eqn: core.JaxprEqn
@@ -1392,7 +1387,8 @@ def _scan_state_partial_discharge_rule(
     unroll, reverse, length):
   # jaxpr: [*consts, *pure_carry, *xs] -> [*pure_carry, *pure_ys]
   # jaxpr_: [*consts, *pure_carry, *xs] -> [*pure_carry, *pure_ys, *ref_outs]
-  discharged_jaxpr = state_discharge.discharge_state2(jaxpr, should_discharge)
+  discharged_jaxpr = state_discharge.discharge_state(
+      jaxpr, should_discharge=should_discharge)
 
   num_xs = len(args) - num_consts - num_carry
   is_ref = [isinstance(a, AbstractRef) and s for a, s in zip(jaxpr.in_avals, should_discharge)]
@@ -1747,7 +1743,7 @@ def _while_loop_batching_rule(axis_data, args, dims, cond_nconsts, cond_jaxpr,
   if any(_OrderedIOEffect in fn.effects for fn in [body_jaxpr, cond_jaxpr]):
     raise Exception("Ordered IO effects not supported in vmap.")
 
-  orig_batched = [d is not batching.not_mapped for d in dims]
+  orig_batched = [d is not None for d in dims]
   cconst_bat, bconst_bat, init_bat = split_list(orig_batched, [cond_nconsts, body_nconsts])
   cconsts, bconsts, init = split_list(args, [cond_nconsts, body_nconsts])
   cconst_dims, bconst_dims, init_dims = split_list(dims, [cond_nconsts, body_nconsts])
@@ -1804,13 +1800,13 @@ def _while_loop_batching_rule(axis_data, args, dims, cond_nconsts, cond_jaxpr,
   # into place.
   new_init = []
   for x, old_axis, new_axis in zip(init, init_dims, carry_dims):
-    if old_axis is batching.not_mapped and new_axis is not batching.not_mapped:
+    if old_axis is None and new_axis is not None:
       new_init.append(batching.broadcast(x, axis_data.size, new_axis,
                                          axis_data.explicit_mesh_axis))
-    elif old_axis is batching.not_mapped and new_axis is batching.not_mapped:
+    elif old_axis is None and new_axis is None:
       new_init.append(x)
     else:
-      assert new_axis is not batching.not_mapped
+      assert new_axis is not None
       new_init.append(batching.moveaxis(x, old_axis, new_axis))
 
   outs = while_p.bind(*(cconsts + bconsts + new_init),
@@ -1851,14 +1847,12 @@ def _while_loop_jvp(primals, tangents, cond_nconsts, cond_jaxpr, body_nconsts,
       [num_carry], [len(init_dot)])
 
   newvar = core.gensym()
-  invars_aug = (
-      cond_jaxpr.jaxpr.invars + [newvar(core.typeof(x)) for x in init_dot])
+  invars_aug = cond_jaxpr.jaxpr.invars + [newvar(core.typeof(x)) for x in init_dot]
   cond_debug = cond_jaxpr.jaxpr.debug_info
-  augmented_debug = cond_debug and (
-      cond_debug._replace(
-          arg_names=cond_debug.arg_names + ("",) * len(init_dot)
-      )
-  )
+  augmented_debug = cond_debug
+  if cond_debug is not None and cond_debug.arg_names is not None:
+    augmented_debug = cond_debug._replace(
+        arg_names=cond_debug.arg_names + ('',) * len(init_dot))
   cond_jaxpr_augmented = cond_jaxpr.jaxpr.replace(
       invars=invars_aug, debug_info=augmented_debug)
   cond_jaxpr_augmented = ClosedJaxpr(cond_jaxpr_augmented, cond_jaxpr.consts)
@@ -2074,16 +2068,16 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
       return out
     return mlir.lower_fun(fun)(ctx, *args)
 
-  loop_carry_types = _map(mlir._aval_to_ir_types, ctx.avals_in)
+  loop_carry_types = _map(partial(mlir._aval_to_ir_types, ctx.module_context), ctx.avals_in)
   body_effects = effects.ordered_effects.filter_in(body_jaxpr.effects)
   num_tokens = len(body_effects)
   tokens = [ctx.tokens_in.get(eff) for eff in body_effects]
   token_types = [mlir.token_type() for _ in tokens]
   loop_carry_types = [*token_types, *loop_carry_types]
-  flat_loop_carry_types = mlir.flatten_ir_types(loop_carry_types)
+  flat_loop_carry_types, loop_carry_treedef = mlir.ir_tree_registry.flatten(loop_carry_types)
   args = [*tokens, *args]
 
-  flat_args = mlir.flatten_ir_values(args)
+  flat_args, _ = mlir.ir_tree_registry.flatten(args)
   while_op = hlo.WhileOp(flat_loop_carry_types, flat_args)
 
   # Loop condition
@@ -2093,7 +2087,7 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
     flat_cond_args = [
         cond_block.arguments[i] for i in range(len(flat_loop_carry_types))
     ]
-    cond_args = mlir.unflatten_ir_values_like_types(flat_cond_args, loop_carry_types)
+    cond_args = loop_carry_treedef.unflatten(flat_cond_args)
     cond_args = cond_args[num_tokens:]  # Remove tokens from cond args
     x, _, z = util.split_list(cond_args, [cond_nconsts, body_nconsts])
     cond_consts = mlir.ir_consts(
@@ -2129,7 +2123,8 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
           pred_ctx,
           pred,
           axes=tuple(range(len(pred_aval.shape))))
-    hlo.return_(mlir.flatten_ir_values([pred]))
+    flat_pred, _ = mlir.ir_tree_registry.flatten([pred])
+    hlo.return_(flat_pred)
 
   # Loop body
   body_block = while_op.regions[1].blocks.append(*flat_loop_carry_types)
@@ -2137,10 +2132,10 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
     flat_body_args = [
         body_block.arguments[i] for i in range(len(flat_loop_carry_types))
     ]
-    body_args = mlir.unflatten_ir_values_like_types(flat_body_args, loop_carry_types)
+    body_args = loop_carry_treedef.unflatten(flat_body_args)
     # Tokens are at the front of the args list to the while loop
     token_args, body_args = util.split_list(body_args, [num_tokens])
-    tokens_in = mlir.TokenSet(zip(body_effects, token_args))
+    tokens_in = mlir.TokenSet(dict(zip(body_effects, token_args)))
     x, y, z = util.split_list(body_args, [cond_nconsts, body_nconsts])
     body_name_stack = name_stack.extend('body')
     body_consts = mlir.ir_consts(
@@ -2164,16 +2159,15 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
           partial(_pred_bcast_select_hlo, ctx, pred_aval, body_pred), new_z, z,
           body_jaxpr.out_avals)
 
-    hlo.return_([*mlir.flatten_ir_values(out_tokens),
-                 *mlir.flatten_ir_values(x), *mlir.flatten_ir_values(y),
-                 *mlir.flatten_ir_values(new_z)])  # pyrefly: ignore[bad-argument-type]
+    flat_out, _ = mlir.ir_tree_registry.flatten([out_tokens, x, y, new_z])
+    hlo.return_(flat_out)
 
-  outputs = mlir.unflatten_ir_values_like_types(while_op.results, loop_carry_types)
+  outputs = loop_carry_treedef.unflatten(while_op.results)
   tokens, _, _, z = util.split_list(outputs, [num_tokens, cond_nconsts, body_nconsts])
   z = [mlir.lower_with_sharding_in_types(ctx, op, aval)
        for op, aval in zip(z, ctx.avals_out)]
   if tokens:
-    ctx.set_tokens_out(mlir.TokenSet(zip(body_effects, tokens)))
+    ctx.set_tokens_out(mlir.TokenSet(dict(zip(body_effects, tokens))))
   return z
 
 def _while_typecheck(_, *in_atoms, cond_jaxpr, body_jaxpr, cond_nconsts,
@@ -2236,30 +2230,30 @@ def _while_partial_discharge_rule(should_discharge, in_avals, out_avals, *args,
     num_remaining_body_consts += num_remaining_cond_consts
 
   num_carry = len(in_avals) - body_nconsts - cond_nconsts
-  body_jaxpr, body_jaxpr_consts = body_jaxpr.jaxpr, body_jaxpr.consts
-  if body_jaxpr_consts:
+  if body_jaxpr.consts:
     raise NotImplementedError("Body jaxpr has consts. If you see this error, "
                               "please open an issue at "
                               "https://github.com/jax-ml/jax/issues")
-  cond_jaxpr, cond_jaxpr_consts = cond_jaxpr.jaxpr, cond_jaxpr.consts
-  if cond_jaxpr_consts:
+  if cond_jaxpr.consts:
     raise NotImplementedError("Cond jaxpr has consts. If you see this error, "
                               "please open an issue at "
                               "https://github.com/jax-ml/jax/issues")
-  (discharged_cond_jaxpr, discharged_cond_consts
-   ) = state_discharge.discharge_state(
-      cond_jaxpr, (),
-      should_discharge=[*cond_consts_discharge, *carry_discharge])
-  if discharged_cond_consts: raise NotImplementedError
+  discharged_cond_jaxpr = state_discharge.discharge_state(
+      cond_jaxpr, should_discharge=[*cond_consts_discharge, *carry_discharge]
+  )
+  if discharged_cond_jaxpr.consts:
+    raise NotImplementedError
   # body_jaxpr has the signature (*body_consts, *carry) -> carry.
   # Some of these body_consts are actually `Ref`s so when we discharge
   # them, they also turn into outputs, effectively turning those consts into
   # carries. However this doesn't fit the expected signature for the body_jaxpr.
   # Therefore we need to rewrite the jaxpr to shuffle around the `Ref`s so that
   # they are part of the carry.
-  discharged_body_jaxpr, discharged_consts = state_discharge.discharge_state(
-      body_jaxpr, (), should_discharge=[*body_consts_discharge, *carry_discharge])
-  if discharged_consts: raise NotImplementedError
+  discharged_body_jaxpr = state_discharge.discharge_state(
+      body_jaxpr, should_discharge=[*body_consts_discharge, *carry_discharge]
+  )
+  if discharged_body_jaxpr.consts:
+    raise NotImplementedError
 
   def new_body(*consts_refs_carry):
     consts, body_refs, cond_refs, carry = split_list(
@@ -2270,9 +2264,12 @@ def _while_partial_discharge_rule(should_discharge, in_avals, out_avals, *args,
       # in the cond jaxpr are persisted via the carry.
       cond_consts, body_consts = split_list(consts, [num_remaining_cond_consts])
       cond_consts_and_refs = merge_lists(cond_is_ref, cond_consts, cond_refs)
-      cond_carry_refs = core.eval_jaxpr(discharged_cond_jaxpr, (),
-                                  *cond_consts_and_refs,
-                                  *carry)
+      cond_carry_refs = core.eval_jaxpr(
+          discharged_cond_jaxpr.jaxpr,
+          discharged_cond_jaxpr.consts,
+          *cond_consts_and_refs,
+          *carry,
+      )
       # Note: in order to handle the same Ref being updated in both the cond
       # and body, we would need to interleave the updated cond_carry_refs into
       # body_refs here.
@@ -2284,9 +2281,12 @@ def _while_partial_discharge_rule(should_discharge, in_avals, out_avals, *args,
       cond_refs_out = cond_refs
 
     body_consts_and_refs = merge_lists(body_is_ref, body_consts, body_refs)
-    body_carry_refs = core.eval_jaxpr(discharged_body_jaxpr, (),
-                                 *body_consts_and_refs,
-                                 *carry)
+    body_carry_refs = core.eval_jaxpr(
+        discharged_body_jaxpr.jaxpr,
+        discharged_body_jaxpr.consts,
+        *body_consts_and_refs,
+        *carry,
+    )
     carry, body_refs_out = split_list(body_carry_refs, [num_carry])
     return [*body_refs_out, *cond_refs_out, *carry]
 
@@ -2309,7 +2309,11 @@ def _while_partial_discharge_rule(should_discharge, in_avals, out_avals, *args,
     del body_refs
     cond_consts_and_refs = merge_lists(cond_is_ref, consts, cond_refs)
     results = core.eval_jaxpr(
-        discharged_cond_jaxpr, (), *cond_consts_and_refs, *carry)
+        discharged_cond_jaxpr.jaxpr,
+        discharged_cond_jaxpr.consts,
+        *cond_consts_and_refs,
+        *carry,
+    )
     predicate, refs_out = split_list(results, [1])
     assert len(refs_out) == len(cond_refs)
     return predicate
@@ -2414,7 +2418,8 @@ def _pred_bcast_select_hlo(ctx,
     pred_aval: core.ShapedArray, pred: ir.Value, x: mlir.IrValues,
     y: mlir.IrValues, x_y_aval: core.AbstractValue) -> Sequence[ir.Value]:
   if x_y_aval is core.abstract_token:
-    return [hlo.after_all(mlir.flatten_ir_values([x, y]))]
+    flat_x_y, _ = mlir.ir_tree_registry.flatten([x, y])
+    return [hlo.after_all(flat_x_y)]
   else:
     assert isinstance(x, ir.Value), x
     assert isinstance(y, ir.Value), y
@@ -2725,7 +2730,7 @@ def _rng_bit_generator_batching_rule(batched_args, batch_dims, *, shape, dtype,
                                      algorithm, out_sharding):
   keys, = batched_args
   bd, = batch_dims
-  if bd is batching.not_mapped:
+  if bd is None:
     return lax.rng_bit_generator_p.bind(
         keys, shape=shape, dtype=dtype, algorithm=algorithm,
         out_sharding=out_sharding), (None, None)
@@ -2899,6 +2904,66 @@ def _interleave(a, b, axis):
 
 ### Cumulative reductions.
 
+def _cumred_chlo_lowering(ctx, x, *, axis, reverse, reducer, identity):
+  dtype = ctx.avals_in[0].dtype
+  init_shape = x.type.shape[:axis] + x.type.shape[axis + 1 :]
+  init_type = ir.RankedTensorType.get(init_shape, x.type.element_type)
+
+  init = mlir.ir_constant(identity(dtype))
+  if init_shape:
+    dims = ir.DenseI64ArrayAttr.get([])
+    init = hlo.BroadcastInDimOp(init_type, init, dims).result
+
+  scan_op = chlo.ScanOp(
+      [x.type],
+      [init_type],
+      [x],
+      [init],
+      dimension=ir.IntegerAttr.get(ir.IntegerType.get_signless(64), axis),
+      is_reverse=ir.BoolAttr.get(reverse),
+      is_associative=ir.BoolAttr.get(True),
+  )
+  body_block = scan_op.body.blocks.append(init_type, init_type)
+  with ir.InsertionPoint(body_block):
+    x_arg, carry_arg = body_block.arguments
+    res = reducer(x_arg, carry_arg)
+    hlo.return_([res, res])
+  return scan_op.results[:1]
+
+
+def _is_supported_cumred(inp, axis, reverse):
+  return False
+  return (
+      jaxlib_extension_version >= 460
+      and not reverse
+      and isinstance(inp, ShapedArray)
+      and core.is_constant_shape(inp.shape)
+      and inp.shape[axis] > 0
+      and inp.sharding.spec[axis] is None
+      and inp.dtype != np.bool_
+      and not np.issubdtype(inp.dtype, np.complexfloating)
+  )
+
+def _cumred_gpu_lowering(
+    reduce_window_fn: Callable,
+    reducer: Callable,
+    identity: Callable,
+    ctx,
+    x,
+    *,
+    axis,
+    reverse,
+):
+  if not _is_supported_cumred(ctx.avals_in[0], axis, reverse):
+    fun = partial(cumred_reduce_window_impl, reduce_window_fn)
+    return mlir.lower_fun(fun, multiple_results=False)(
+        ctx, x, axis=axis, reverse=reverse
+    )
+  return _cumred_chlo_lowering(
+      ctx, x, axis=axis, reverse=reverse, reducer=reducer, identity=identity
+  )
+
+
 def cumsum(operand: Array, axis: int = 0, reverse: bool = False) -> Array:
   """Computes a cumulative sum along `axis`."""
   return cumsum_p.bind(operand, axis=int(axis), reverse=bool(reverse))
@@ -3014,3 +3079,19 @@ ad.primitive_jvps[cumlogsumexp_p] = partial(_cumulative_jvp_rule, combine_fn=log
 ad.primitive_jvps[cumprod_p] = partial(_cumulative_jvp_rule, combine_fn=lax.mul)
 ad.primitive_jvps[cummin_p] = partial(_cumulative_jvp_rule, combine_fn=lax.min)
 ad.primitive_jvps[cummax_p] = partial(_cumulative_jvp_rule, combine_fn=lax.max)
+
+# TODO(csigg): Register lowering for cumprod etc as well. Although those don't
+# have a corresponding custom kernel implementation in XLA (like cumsum does
+# with CUB), XLA's TryOptimizeAssociativeScan pass will intercept these scans
+# and expand them to the same reduce-window tree as if we emitted a
+# reduce-window series directly here.
+mlir.register_lowering(
+    cumsum_p,
+    partial(
+        _cumred_gpu_lowering,
+        windowed_reductions._reduce_window_sum,
+        hlo.add,
+        lax._get_sum_identity,
+    ),
+    platform='gpu',
+)

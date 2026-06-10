@@ -8,7 +8,7 @@ jax.scipy.cluster
 
 .. autosummary::
    :toctree: _autosummary
-   
+
    vq
 
 jax.scipy.fft
@@ -57,17 +57,27 @@ jax.scipy.linalg
    cho_factor
    cho_solve
    cholesky
+   circulant
+   companion
+   convolution_matrix
    det
+   dft
    eigh
    eigh_tridiagonal
    expm
    expm_frechet
+   fiedler
+   fiedler_companion
    funm
    hadamard
+   helmert
    hessenberg
    hankel
    hilbert
    inv
+   invhilbert
+   invpascal
+   leslie
    lu
    lu_factor
    lu_solve
@@ -159,10 +169,15 @@ jax.scipy.special
    beta
    betainc
    betaln
+   boxcox
+   boxcox1p
+   comb
+   dawsn
    digamma
    entr
    erf
    erfc
+   erfcx
    erfinv
    exp1
    expi
@@ -192,6 +207,7 @@ jax.scipy.special
    multigammaln
    ndtr
    ndtri
+   owens_t
    poch
    polygamma
    rel_entr
@@ -199,6 +215,7 @@ jax.scipy.special
    softmax
    spence
    sph_harm_y
+   wofz
    xlog1py
    xlogy
    zeta
